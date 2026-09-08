@@ -97,7 +97,8 @@ version_from_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --version)
-                [ $# -ge 2 ] && [ -n "$2" ] || die "--version needs a release tag"
+                [ $# -ge 2 ] || die "--version needs a release tag"
+                [ -n "$2" ] || die "--version needs a release tag"
                 printf '%s' "$2"; return 0 ;;
             --version=*)
                 [ -n "${1#*=}" ] || die "--version needs a release tag"
