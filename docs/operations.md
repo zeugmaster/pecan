@@ -2,7 +2,43 @@
 
 Procedures beyond the README's quick reference. Everything here assumes an
 installation created by the installer (deployment files + `.env` + the
-`mintctl` binary in one directory, default `/opt/pecan`).
+`mintctl` binary in one directory, default `~/pecan` for a normal user or
+`/opt/pecan` for root on Linux).
+
+## Installing and operating without root
+
+Run the installer and `mintctl` as the same user, with a working `docker info`
+and Docker Compose v2 supporting `up --wait --wait-timeout`. Normal users
+get `~/pecan` and `~/.local/bin/mintctl`; root gets `/opt/pecan` and
+`/usr/local/bin/mintctl`. `--dir` accepts an absolute or relative path. Add
+`export PATH="$HOME/.local/bin:$PATH"` to your shell startup file if needed;
+`~/pecan/mintctl` also works directly. A second install keeps an existing
+`mintctl` link, and each new directory gets its own Compose project name.
+
+Pecan uses your current Docker context. You can use either a daemon your
+user has permission to access or [rootless Docker](https://docs.docker.com/engine/security/rootless/).
+Installing system Docker with `--install-docker` requires root; setting up
+rootless Docker is a separate prerequisite. If permissions were just
+granted through group membership, log in again before retrying.
+
+Rootless Docker may be unable to publish ports 80/443 under the host's
+privileged-port settings. The installer warns about this before committing
+configuration. Use `--behind-proxy --console-domain console.example.org`
+with an existing proxy, or `--plain-http` with unprivileged ports on a
+trusted LAN. See Docker's [privileged-port configuration](https://docs.docker.com/engine/security/rootless/tips/#exposing-privileged-ports)
+if you want bundled Caddy with rootless Docker.
+
+If an install fails after configuration was saved, run
+`<install-dir>/mintctl start` to retry image downloads and startup. The
+generated credentials remain in `.env` and `mint/mnemonic`; rerunning the
+installer refuses to replace them. Downloads and configuration validation
+before that point can be retried with the original install command.
+
+For an existing root-owned installation, continue managing it as its owner;
+new user-owned defaults do not move its files or volumes. Set
+`MINTCTL_DIR=/path/to/install` to select an installation explicitly. Backup
+archives and restored mint files are written by the invoking user, even
+when Docker runs as root.
 
 Scope note: this stack is the **branch processor** — the payment backend and
 teller console that attaches to one cdk-mintd. If you run the mint yourself
@@ -175,7 +211,9 @@ container. To migrate:
    volume (or copy it) and the last generated `mint.toml` from the config
    volume. The mint's recovery mnemonic is inside that `mint.toml`; it is
    yours now — back it up.
-3. Update the install. On first start the processor migrates its
+3. After verifying that the mint runs independently, remove the obsolete
+   `MINT_MODE=...` line from the old install's `.env`, then update the install.
+   Keep the old backup. On first start the processor migrates its
    configuration automatically: the old `setup.json` (which also contains the
    mnemonic) is preserved as `setup.json.v3-managed.bak` on the config volume
    and is never deleted; the console shows a one-time notice.
@@ -227,13 +265,63 @@ the mint's hostname through (`--mint-domain`); remember that changing the
 mint's hostname changes the URL wallets — and the console's Mint tab —
 point at.
 
-## Updates and rollback
+## Updates and recovery
 
-`mintctl update` moves the deployment files, the `mintctl` binary, and the
-image **together** to a release tag, then waits for `/healthz` and compares
-the reported version. Roll back the same way: `mintctl update --version
-vX.Y.Z` with the previous tag. Data volumes are untouched in both
-directions; take a backup before major updates anyway.
+```sh
+mintctl update --check                  # preview, without changing the install
+mintctl update                         # latest console/processor and CLI
+mintctl update --with-mint              # also the target release's tested mint
+mintctl update --with-mint --check      # preview both version changes
+mintctl update --version vX.Y.Z         # choose a particular Pecan release
+mintctl update --mint-version <tag>     # mint only; keep the current console
+mintctl update --version vX.Y.Z --mint-version <tag>  # explicit pairing
+mintctl update --with-mint --yes        # unattended update of both
+```
+
+The default update preserves `MINT_VERSION`. `--with-mint` reads the tested
+mint pin from the **target release**, rather than guessing the newest
+upstream mint. An explicit `--mint-version` alone updates only the mint;
+combine it with `--version` to move both. External mints are managed with
+their own tooling. Pre-0.2 managed mints need the migration above.
+
+If your installed CLI predates these options, use the current bootstrap to
+perform the update (run as the installation's owner, adjusting the path):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zeugmaster/pecan/main/install.sh \
+  | MINTCTL_DIR="$HOME/pecan" bash -s -- update --with-mint
+```
+
+The CLI displays the proposed versions and asks for confirmation; `--yes`
+approves unattended operation. It stages the deployment files and verified
+CLI binary, validates Compose configuration, and pulls the selected images
+before changing live files. Failed downloads, invalid configuration, or a
+failed backup leave the existing version pins in place.
+
+Before activation it briefly stops the running services for a consistent
+snapshot, then restarts them. The private directory
+`<install-dir>/updates/before-*/` contains `backup.tar.gz`, previous
+deployment files and the CLI, plus `RECOVERY.txt`. The archive includes a
+bundled mint's database and seed. Encrypt off-server copies and remove old
+local backups when your retention policy allows. Backups need free disk
+space for the full data snapshot and the `debian:bookworm-slim` helper image
+(pulled before downtime if absent).
+
+Only selected services are recreated. A console-only update does not
+change the mint pin or recreate its container, although it pauses the mint
+for the snapshot. Compose waits for container health before reporting
+success; verify the Mint tab's attachment checklist after changing the
+mint/processor pairing. Existing named volumes, unselected containers and
+old images are retained. Deployment templates are replaced on console
+updates; the snapshot retains any local edits for review and reapplication.
+
+If activation fails, the target pins and recovery snapshot remain. Inspect
+`mintctl logs` and retry `mintctl start` after fixing the cause. **Do not
+downgrade a mint against a database that a newer version may have migrated.**
+For deliberate recovery, stop the stack, restore the saved deployment files
+and CLI (preserving permissions), then use that CLI's `restore` command with
+the saved archive, as described in `RECOVERY.txt`. Restoring discards activity
+since the snapshot. Pecan does not attempt an automatic database downgrade.
 
 ## Health and monitoring
 

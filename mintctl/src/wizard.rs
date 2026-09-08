@@ -44,7 +44,11 @@ macro_rules! step {
 }
 
 pub fn run(args: &InstallArgs) -> Result<()> {
-    intro(console::style(" Pecan — branch processor ").on_cyan().black())?;
+    intro(
+        console::style(" Pecan — branch processor ")
+            .on_cyan()
+            .black(),
+    )?;
 
     // --- resolve version early: everything else is pinned to it -----------
     install::preflight_platform()?;
@@ -99,7 +103,7 @@ pub fn run(args: &InstallArgs) -> Result<()> {
             }
             Existing::OtherDir => {
                 let dir: String = step!(input("Install directory")
-                    .placeholder("/opt/pecan-2")
+                    .placeholder("./pecan-2")
                     .validate(|value: &String| {
                         if value.trim().is_empty() {
                             Err("enter a directory path")
@@ -108,7 +112,7 @@ pub fn run(args: &InstallArgs) -> Result<()> {
                         }
                     })
                     .interact());
-                install_dir = PathBuf::from(dir.trim());
+                install_dir = install::resolve_install_dir(Some(PathBuf::from(dir.trim())))?;
             }
         }
     }
@@ -160,7 +164,7 @@ pub fn run(args: &InstallArgs) -> Result<()> {
         if preflight::port_status(*port) == PortStatus::Busy {
             log::warning(format!("Port {port} (for the {label}) is already in use."))?;
             let answer: String = step!(input(format!("Alternative {label} port"))
-                .default_input(&(*port + 10000).to_string())
+                .default_input(&port.saturating_add(10000).to_string())
                 .validate(|value: &String| match value.trim().parse::<u16>() {
                     Ok(p) if p >= 1024 => Ok(()),
                     _ => Err("enter a port number (1024-65535)"),
@@ -269,7 +273,7 @@ pub fn run(args: &InstallArgs) -> Result<()> {
                 } else {
                     "Domain with automatic HTTPS (recommended)"
                 },
-                tls_hint
+                tls_hint,
             )
             .item(
                 AccessMode::BehindProxy,
@@ -278,13 +282,9 @@ pub fn run(args: &InstallArgs) -> Result<()> {
                 } else {
                     "Behind my own reverse proxy"
                 },
-                "binds to localhost; you get ready-made Caddy/nginx snippets"
+                "binds to localhost; you get ready-made Caddy/nginx snippets",
             )
-            .item(
-                AccessMode::PlainHttp,
-                "Plain HTTP",
-                "LAN or testing only"
-            );
+            .item(AccessMode::PlainHttp, "Plain HTTP", "LAN or testing only");
         sel = sel.initial_value(if ports_busy {
             AccessMode::BehindProxy
         } else {
@@ -625,7 +625,11 @@ fn confirm_dns(
             Abort,
         }
         match step!(select("How do you want to proceed?")
-            .item(Next::Recheck, "Check again", "after creating or fixing the record")
+            .item(
+                Next::Recheck,
+                "Check again",
+                "after creating or fixing the record"
+            )
             .item(
                 Next::Continue,
                 "Continue anyway",
@@ -636,7 +640,11 @@ fn confirm_dns(
                 "Switch to plain HTTP",
                 "skip TLS for now; mintctl domain can set it up later"
             )
-            .item(Next::Abort, "Abort the install", "nothing has been changed yet")
+            .item(
+                Next::Abort,
+                "Abort the install",
+                "nothing has been changed yet"
+            )
             .interact())
         {
             Next::Recheck => continue,
@@ -654,59 +662,16 @@ fn confirm_dns(
 }
 
 fn ensure_docker_interactive() -> Result<()> {
-    if !compose::docker_available() {
-        if cfg!(target_os = "macos") {
-            let _ = outro_cancel(
-                "Docker is not installed. Install Docker Desktop (or OrbStack) and re-run.",
-            );
-            bail!("Docker is required");
-        }
-        log::warning("Docker is not installed.")?;
-        if step!(confirm("Install Docker now via https://get.docker.com?")
-            .initial_value(true)
-            .interact())
-        {
-            let sp = spinner();
-            sp.start("Installing Docker (this takes a minute) ...");
-            let output = std::process::Command::new("sh")
-                .args(["-c", "curl -fsSL https://get.docker.com | sh"])
-                .output()?;
-            if output.status.success() {
-                sp.stop("Docker installed.");
-            } else {
-                sp.error("The Docker installer failed");
-                bail!(
-                    "docker install failed:\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                        .lines()
-                        .rev()
-                        .take(6)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
-            }
+    let allow_install =
+        if !compose::docker_available() && compose::is_root() && cfg!(target_os = "linux") {
+            log::warning("Docker is not installed.")?;
+            step!(confirm("Install Docker now via https://get.docker.com?")
+                .initial_value(true)
+                .interact())
         } else {
-            let _ = outro_cancel("Docker is required. Install it and re-run.");
-            bail!("Docker is required");
-        }
-    }
-    if !compose::docker_daemon_running() {
-        let _ = outro_cancel(
-            "The Docker daemon is not responding. Start it (or re-run as root / \
-             add this user to the docker group) and try again.",
-        );
-        bail!("the Docker daemon is not responding");
-    }
-    if !compose::compose_v2_available() {
-        let _ = outro_cancel(
-            "Docker Compose v2 is required (the 'docker compose' plugin). \
-             Install docker-compose-plugin and re-run.",
-        );
-        bail!("Docker Compose v2 is required");
-    }
+            false
+        };
+    compose::ensure_docker(allow_install)?;
     log::success("Docker is ready.")?;
     Ok(())
 }
@@ -718,20 +683,32 @@ fn execute_with_progress(plan: &InstallPlan, args: &InstallArgs) -> Result<()> {
         install::ensure_local_image(&plan.version)?;
     }
     install::guard_fresh_dir(&plan.install_dir)?;
-    let source =
-        install::artifact_source(args.artifacts_dir.clone(), args.artifact_ref.clone(), &plan.version);
+    let _lock = crate::storage::lock(&plan.install_dir)?;
+    let source = install::artifact_source(
+        args.artifacts_dir.clone(),
+        args.artifact_ref.clone(),
+        &plan.version,
+    );
 
     let sp = spinner();
-    sp.start(format!("Fetching the {} deployment artifacts ...", plan.version));
-    install::fetch_deploy_artifacts(&source, &plan.install_dir)?;
-    install::install_binary(&source, &plan.version, &plan.install_dir.join("mintctl"))?;
-    install::write_config(plan)?;
-    sp.stop(format!("Deployment artifacts in {}", plan.install_dir.display()));
+    sp.start(format!(
+        "Fetching the {} deployment artifacts ...",
+        plan.version
+    ));
+    install::prepare_install(&source, plan)?;
+    sp.stop(format!(
+        "Deployment artifacts in {}",
+        plan.install_dir.display()
+    ));
 
     let stack = Stack {
         install_dir: plan.install_dir.clone(),
     };
-    let images = if plan.mint.is_some() { "images" } else { "image" };
+    let images = if plan.mint.is_some() {
+        "images"
+    } else {
+        "image"
+    };
     if plan.no_pull {
         log::step(format!(
             "Skipping the image pull (--no-pull); using the local {} image.",
@@ -739,11 +716,18 @@ fn execute_with_progress(plan: &InstallPlan, args: &InstallArgs) -> Result<()> {
         ))?;
     } else {
         let sp = spinner();
-        sp.start(format!("Pulling the container {images} ({}) ...", plan.version));
+        sp.start(format!(
+            "Pulling the container {images} ({}) ...",
+            plan.version
+        ));
         match stack.compose_quiet(&["pull", "--quiet"]) {
             Ok(()) => sp.stop(format!(
                 "{} pulled.",
-                if plan.mint.is_some() { "Images" } else { "Image" }
+                if plan.mint.is_some() {
+                    "Images"
+                } else {
+                    "Image"
+                }
             )),
             Err(e) => {
                 sp.error("Image pull failed");
@@ -766,34 +750,19 @@ fn execute_with_progress(plan: &InstallPlan, args: &InstallArgs) -> Result<()> {
 
     let sp = spinner();
     sp.start("Starting the stack ...");
-    if let Err(e) = stack.compose_quiet(&["up", "-d", "--remove-orphans"]) {
+    if let Err(e) = stack.compose_quiet(&[
+        "up",
+        "-d",
+        "--pull",
+        "never",
+        "--wait",
+        "--wait-timeout",
+        "120",
+    ]) {
         sp.error("The stack did not start");
         return Err(e);
     }
     sp.stop("Stack started.");
-
-    let sp = spinner();
-    sp.start("Waiting for the operator console ...");
-    if !compose::wait_healthy(plan.ui_port, Duration::from_secs(120)) {
-        sp.error("The console did not become healthy within 2 minutes");
-        bail!(
-            "check '{}/mintctl logs processor'",
-            plan.install_dir.display()
-        );
-    }
-    sp.stop("Operator console is up.");
-
-    if let Some(mint_plan) = &plan.mint {
-        let sp = spinner();
-        sp.start("Waiting for the mint ...");
-        let url = format!("http://127.0.0.1:{}/v1/info", mint_plan.mint_port);
-        if compose::wait_http_ok(&url, Duration::from_secs(120)) {
-            sp.stop("Mint is up and linked to the processor.");
-        } else {
-            sp.error("The mint did not come up within 2 minutes");
-            bail!("check '{}/mintctl logs mintd'", plan.install_dir.display());
-        }
-    }
 
     if plan.access == AccessMode::DomainTls {
         let sp = spinner();
@@ -826,7 +795,6 @@ fn execute_with_progress(plan: &InstallPlan, args: &InstallArgs) -> Result<()> {
             }
         }
     }
-    install::install_cli_symlink(&plan.install_dir);
     Ok(())
 }
 
@@ -894,11 +862,15 @@ fn finish(plan: &InstallPlan) -> Result<()> {
 
 pub fn domain_command(args: &DomainArgs) -> Result<()> {
     let stack = Stack::discover()?;
+    let _lock = crate::storage::lock(&stack.install_dir)?;
     let mut envf = EnvFile::load(&stack.env_path())?;
     let interactive = !args.yes && crate::ui::have_tty();
 
     let current_domain = envf.get("CONSOLE_DOMAIN").unwrap_or_default();
-    let ui_port: u16 = envf.get("UI_PORT").and_then(|p| p.parse().ok()).unwrap_or(9090);
+    let ui_port: u16 = envf
+        .get("UI_PORT")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9090);
     // A bundled-mint install keeps its mint profile and gets the mint's
     // hostname carried through every access change.
     let has_mint = envf

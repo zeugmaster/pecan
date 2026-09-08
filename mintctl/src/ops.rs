@@ -1,18 +1,14 @@
 //! The operations subcommands: everything except install.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use time::macros::format_description;
 
-use crate::caddy;
 use crate::compose::{self, Stack, BIN_LINK};
 use crate::envfile::EnvFile;
-use crate::install;
 use crate::release;
 use crate::ui::{self, Ui};
-use crate::UpdateArgs;
 
 fn env(stack: &Stack) -> Result<EnvFile> {
     EnvFile::load(&stack.env_path())
@@ -44,12 +40,16 @@ pub fn status() -> Result<()> {
     }
     ui::say(format!(
         "installed version: {}",
-        if version.is_empty() { "unknown" } else { &version }
+        if version.is_empty() {
+            "unknown"
+        } else {
+            &version
+        }
     ));
     match release::resolve_latest_version() {
-        Ok(latest) if latest != version => {
-            ui::say(format!("latest release:    {latest}  → run 'mintctl update'"))
-        }
+        Ok(latest) if latest != version => ui::say(format!(
+            "latest release:    {latest}  → run 'mintctl update'"
+        )),
         Ok(latest) => ui::say(format!("latest release:    {latest} (up to date)")),
         Err(_) => {}
     }
@@ -63,184 +63,20 @@ pub fn logs(services: &[String]) -> Result<()> {
     stack.compose(&args)
 }
 
-pub fn update(args: &UpdateArgs) -> Result<()> {
-    let stack = Stack::discover()?;
-    let mut envf = env(&stack)?;
-    // Pre-0.2 installs bundled a MANAGED cdk-mintd in this compose project
-    // (marker: the MINT_MODE key the old installer wrote — none of the
-    // current MINT_* keys is MINT_MODE, so this cannot misfire on 0.3+
-    // bundled-mint installs). The new compose file has no managed mint
-    // service, so `up --remove-orphans` would take their mint container down
-    // mid-update. Refuse and point at the migration note.
-    if envf.get("MINT_MODE").is_some() {
-        bail!(
-            "this install was created by a pre-0.2 version that bundled a managed mint. \
-             Since 0.2 the mint runs from its own official image (or outside the stack) — \
-             updating in place would remove the old managed mint container. \
-             See docs/operations.md (\"Migrating from the bundled mint\") before updating."
-        );
-    }
-    // The bundled mint's image is pinned independently: it holds money, so a
-    // pecan release never drags it along. --mint-version upgrades it
-    // deliberately (with or without a processor update).
-    if let Some(mint_version) = &args.mint_version {
-        if envf.get("MINT_VERSION").is_none() {
-            bail!("--mint-version only applies to installs with a bundled mint");
-        }
-        envf.set("MINT_VERSION", mint_version);
-        envf.save()?;
-        ui::say(format!("mint image pinned to cashubtc/mintd:{mint_version}"));
-    }
-    let current = envf.get("VERSION").unwrap_or_default();
-    let target = match &args.version {
-        Some(v) => v.clone(),
-        None => release::resolve_latest_version()
-            .context("could not resolve the latest release; pass --version vX.Y.Z")?,
-    };
-    if target == current {
-        if args.mint_version.is_some() {
-            // Only the mint moves: pull and restart with the new pin.
-            if !args.no_pull {
-                stack.compose(&["pull", "--quiet"])?;
-            }
-            stack.compose(&["up", "-d", "--remove-orphans"])?;
-            let mint_port = envf.get("MINT_PORT").unwrap_or_else(|| "3338".into());
-            if !compose::wait_http_ok(
-                &format!("http://127.0.0.1:{mint_port}/v1/info"),
-                Duration::from_secs(120),
-            ) {
-                bail!("the mint did not come back after the update — check 'mintctl logs mintd'");
-            }
-            ui::say("mint updated");
-        } else {
-            ui::say(format!("already on {current}"));
-        }
-        return Ok(());
-    }
-    ui::say(format!(
-        "Updating {} → {target}",
-        if current.is_empty() { "?" } else { &current }
-    ));
-
-    // Artifacts and image always move together: stage the target tag's
-    // artifacts (and its mintctl binary) before switching the version.
-    let source = install::artifact_source(args.artifacts_dir.clone(), args.artifact_ref.clone(), &target);
-    let staging = tempfile::tempdir_in(&stack.install_dir).context("create staging dir")?;
-    install::fetch_deploy_artifacts(&source, staging.path())?;
-    let staged_binary = staging.path().join("mintctl");
-    install::install_binary(&source, &target, &staged_binary)?;
-
-    for artifact in ["docker-compose.yml", "Caddyfile", ".env.example"] {
-        std::fs::rename(staging.path().join(artifact), stack.install_dir.join(artifact))
-            .with_context(|| format!("move {artifact} into place"))?;
-    }
-    // Replacing the running binary via rename is safe on unix — the running
-    // inode lives on until process exit.
-    std::fs::rename(&staged_binary, stack.install_dir.join("mintctl"))
-        .context("move mintctl into place")?;
-    caddy::apply_acme_email(&stack.install_dir, &envf.get("ACME_EMAIL").unwrap_or_default())?;
-    // The fresh Caddyfile artifact has no mint site block — re-apply it for
-    // bundled-mint installs serving the mint through the bundled Caddy.
-    let mint_site_enabled = envf
-        .get("COMPOSE_PROFILES")
-        .unwrap_or_default()
-        .split(',')
-        .any(|p| p.trim() == "mint")
-        && envf
-            .get("COMPOSE_PROFILES")
-            .unwrap_or_default()
-            .split(',')
-            .any(|p| p.trim() == "tls")
-        && envf.get("MINT_DOMAIN").is_some_and(|d| !d.is_empty());
-    caddy::apply_mint_site(&stack.install_dir, mint_site_enabled)?;
-
-    envf.set("VERSION", &target);
-    envf.save()?;
-    if !args.no_pull {
-        stack.compose(&["pull", "--quiet"])?;
-    }
-    stack.compose(&["up", "-d", "--remove-orphans"])?;
-
-    let ui_port: u16 = envf
-        .get("UI_PORT")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9090);
-    if !compose::wait_healthy(ui_port, Duration::from_secs(120)) {
-        bail!("the console did not come back after the update — check 'mintctl logs processor'");
-    }
-    if let Some(running) = compose::probe_healthz(&format!("http://127.0.0.1:{ui_port}/healthz")) {
-        if !running.is_empty() && running != target {
-            ui::warn(format!("console reports version {running}, expected {target}"));
-        }
-    }
-    let _ = std::process::Command::new("docker")
-        .args(["image", "prune", "-f"])
-        .output();
-    ui::say(format!("updated to {target}"));
-    Ok(())
-}
-
 pub fn backup(output: Option<PathBuf>) -> Result<()> {
     let stack = Stack::discover()?;
-    let envf = env(&stack)?;
+    let _lock = crate::storage::lock(&stack.install_dir)?;
     let out = match output {
         Some(path) => absolutize(path)?,
         None => {
-            let stamp = time::OffsetDateTime::now_utc()
-                .format(format_description!(
-                    "[year][month][day]-[hour][minute][second]"
-                ))
-                .unwrap_or_default();
+            let stamp = time::OffsetDateTime::now_utc().format(format_description!(
+                "[year][month][day]-[hour][minute][second]"
+            ))?;
             absolutize(PathBuf::from(format!("pecan-backup-{stamp}.tar.gz")))?
         }
     };
-    let project = envf
-        .get("COMPOSE_PROJECT_NAME")
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| compose::project_name(&stack.install_dir));
-    let out_dir = out.parent().context("backup path has no directory")?;
-    let out_name = out
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("backup path has no file name")?;
-
-    let has_mint = envf
-        .get("COMPOSE_PROFILES")
-        .unwrap_or_default()
-        .split(',')
-        .any(|p| p.trim() == "mint");
-
-    ui::say("Stopping services for a consistent snapshot ...");
-    stack.compose(&["stop"])?;
-    let mut cmd = std::process::Command::new("docker");
-    cmd.args(["run", "--rm"])
-        .args(["-v", &format!("{project}_config-data:/backup/config:ro")])
-        .args(["-v", &format!("{project}_processor-data:/backup/processor:ro")])
-        .args(["-v", &format!("{}:/backup/install:ro", stack.install_dir.display())])
-        .args(["-v", &format!("{}:/out", out_dir.display())]);
-    if has_mint {
-        cmd.args(["-v", &format!("{project}_mintd-data:/backup/mint-data:ro")]);
-    }
-    cmd.arg("debian:bookworm-slim").args([
-        "tar",
-        "czf",
-        &format!("/out/{out_name}"),
-        "-C",
-        "/backup",
-        "config",
-        "processor",
-        "install/.env",
-    ]);
-    if has_mint {
-        // The mint's database and its seed + config: the archive can mint
-        // this install's ecash.
-        cmd.args(["mint-data", "install/mint"]);
-    }
-    let status = cmd.status().context("run the backup container")?;
-    stack.compose(&["start"])?;
-    if !status.success() {
-        bail!("the backup container failed");
-    }
+    backup_to(&stack, &out)?;
+    let has_mint = has_profile(&env(&stack)?, "mint");
     ui::say("");
     ui::say(format!("Backup written to {}", out.display()));
     if has_mint {
@@ -257,8 +93,122 @@ pub fn backup(output: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn has_profile(env: &EnvFile, profile: &str) -> bool {
+    env.get("COMPOSE_PROFILES")
+        .unwrap_or_default()
+        .split(',')
+        .any(|p| p.trim() == profile)
+}
+
+/// Stream tar to a private host-owned file: Docker never creates root-owned
+/// backup files in the user's directory. Always attempt to restart after stop,
+/// including when spawning tar fails. Keep an existing archive on failure.
+pub(crate) fn backup_to(stack: &Stack, out: &std::path::Path) -> Result<()> {
+    use std::process::{Command, Stdio};
+    let envf = env(stack)?;
+    if out.exists() {
+        bail!(
+            "backup already exists: {}; choose another filename",
+            out.display()
+        );
+    }
+    let has_mint = has_profile(&envf, "mint");
+    let project = envf
+        .get("COMPOSE_PROJECT_NAME")
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| compose::project_name(&stack.install_dir));
+    let temp = tempfile::NamedTempFile::new_in(out.parent().context("backup path has no parent")?)?;
+    // Pull the helper before downtime, and only if it is absent.
+    if !compose::image_present("debian:bookworm-slim") {
+        let status = Command::new("docker")
+            .args(["pull", "debian:bookworm-slim"])
+            .status()?;
+        if !status.success() {
+            bail!("could not pull the backup helper image");
+        }
+    }
+    // Restart exactly the services that were running, including on failures.
+    let running = stack
+        .compose_command(&["ps", "--services", "--filter", "status=running"])?
+        .output()?;
+    if !running.status.success() {
+        bail!("cannot determine running services before backup");
+    }
+    let running = String::from_utf8(running.stdout)?;
+    let services: Vec<&str> = running.lines().filter(|s| !s.is_empty()).collect();
+    let mut stop = vec!["stop"];
+    stop.extend(&services);
+    let snapshot = (|| -> Result<()> {
+        if !services.is_empty() {
+            ui::say("Stopping services for a consistent snapshot ...");
+            stack.compose(&stop)?;
+        }
+        let mut cmd = Command::new("docker");
+        cmd.args(["run", "--rm", "--network", "none"])
+            .args(["-v", &format!("{project}_config-data:/backup/config:ro")])
+            .args([
+                "-v",
+                &format!("{project}_processor-data:/backup/processor:ro"),
+            ])
+            .args([
+                "-v",
+                &format!("{}:/backup/install:ro", stack.install_dir.display()),
+            ]);
+        if has_mint {
+            cmd.args(["-v", &format!("{project}_mintd-data:/backup/mint-data:ro")]);
+        }
+        cmd.arg("debian:bookworm-slim").args([
+            "tar",
+            "czf",
+            "-",
+            "-C",
+            "/backup",
+            "config",
+            "processor",
+            "install/.env",
+        ]);
+        if has_mint {
+            cmd.args(["mint-data", "install/mint"]);
+        }
+        let status = cmd
+            .stdout(Stdio::from(temp.as_file().try_clone()?))
+            .status()
+            .context("run backup container")?;
+        if !status.success() {
+            bail!("the backup container failed");
+        }
+        temp.as_file().sync_all()?;
+        Ok(())
+    })();
+    let mut start = vec!["start"];
+    start.extend(&services);
+    let restart = if services.is_empty() {
+        Ok(())
+    } else {
+        stack.compose(&start)
+    };
+    if let Err(error) = snapshot {
+        return match restart {
+            Ok(()) => Err(error),
+            Err(restart_error) => Err(error.context(format!(
+                "services also failed to restart: {restart_error:#}; run mintctl start"
+            ))),
+        };
+    }
+    // Keep the snapshot even if restarting fails; it is the recovery path.
+    temp.persist_noclobber(out).with_context(|| {
+        format!(
+            "save backup {} (existing archives are never replaced)",
+            out.display()
+        )
+    })?;
+    restart.context("backup saved, but services could not restart; run mintctl start")?;
+    Ok(())
+}
+
 pub fn restore(archive: PathBuf, yes: bool) -> Result<()> {
     let stack = Stack::discover()?;
+    let _lock = crate::storage::lock(&stack.install_dir)?;
     let envf = env(&stack)?;
     let ui_prompt = Ui::new(yes);
     if !archive.is_file() {
@@ -304,6 +254,22 @@ pub fn restore(archive: PathBuf, yes: bool) -> Result<()> {
         );
     }
 
+    // Read these before stopping or replacing state; write on the host so
+    // a non-root operator retains ownership even with a rootful daemon.
+    let mut mint_files = Vec::new();
+    if archive_has_mint {
+        for name in ["config.toml", "mnemonic"] {
+            let output = std::process::Command::new("tar")
+                .arg("xOzf")
+                .arg(&archive)
+                .arg(format!("install/mint/{name}"))
+                .output()?;
+            if !output.status.success() {
+                bail!("archive is missing mint/{name}");
+            }
+            mint_files.push((name, output.stdout));
+        }
+    }
     ui::say("Restoring replaces the processor's current state (attachment config,");
     ui::say(format!(
         "operator accounts, ticket ledger) of project '{project}' with the archive"
@@ -331,43 +297,44 @@ pub fn restore(archive: PathBuf, yes: bool) -> Result<()> {
             bail!("could not create volume {project}_{vol}");
         }
     }
-    // Extracting named members only also accepts pre-0.2 archives, whose
-    // additional mint/ directory is simply skipped. Bundled archives restore
-    // the mint volume plus the install-dir mint/ files (config + seed, 0600)
-    // together, so cdk's signer-fingerprint check stays consistent.
+    // Archive filenames are positional shell arguments, never shell source.
     let script = if archive_has_mint {
-        format!(
-            "find /restore/config /restore/processor /restore/mint-data -mindepth 1 -delete \
-             && tar xzf /in/{archive_name} -C /restore config processor mint-data \
-             && rm -rf /restore/install-dir/mint \
-             && tar xzf /in/{archive_name} -C /restore-staging install/mint \
-             && mv /restore-staging/install/mint /restore/install-dir/mint \
-             && chmod 700 /restore/install-dir/mint \
-             && chmod 600 /restore/install-dir/mint/*"
-        )
+        "find /restore/config /restore/processor /restore/mint-data -mindepth 1 -delete && tar xzf \"$1\" -C /restore config processor mint-data"
     } else {
-        format!(
-            "find /restore/config /restore/processor -mindepth 1 -delete \
-             && tar xzf /in/{archive_name} -C /restore config processor"
-        )
+        "find /restore/config /restore/processor -mindepth 1 -delete && tar xzf \"$1\" -C /restore config processor"
     };
     let mut cmd = std::process::Command::new("docker");
     cmd.args(["run", "--rm"])
         .args(["-v", &format!("{project}_config-data:/restore/config")])
-        .args(["-v", &format!("{project}_processor-data:/restore/processor")])
+        .args([
+            "-v",
+            &format!("{project}_processor-data:/restore/processor"),
+        ])
         .args(["-v", &format!("{}:/in:ro", archive_dir.display())]);
     if archive_has_mint {
-        cmd.args(["-v", &format!("{project}_mintd-data:/restore/mint-data")])
-            .args(["-v", &format!("{}:/restore/install-dir", stack.install_dir.display())])
-            .args(["--tmpfs", "/restore-staging"]);
+        cmd.args(["-v", &format!("{project}_mintd-data:/restore/mint-data")]);
     }
     let status = cmd
         .arg("debian:bookworm-slim")
-        .args(["sh", "-c", &script])
+        .args([
+            "sh",
+            "-c",
+            script,
+            "restore",
+            &format!("/in/{archive_name}"),
+        ])
         .status()
         .context("run the restore container")?;
     if !status.success() {
         bail!("the restore container failed");
+    }
+    if archive_has_mint {
+        let dir = stack.install_dir.join("mint");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        for (name, content) in mint_files {
+            crate::storage::atomic_write(&dir.join(name), &content, 0o600)?;
+        }
     }
     stack.compose(&["up", "-d", "--remove-orphans"])?;
     ui::say("restore complete — check 'mintctl status'");
@@ -375,15 +342,20 @@ pub fn restore(archive: PathBuf, yes: bool) -> Result<()> {
 }
 
 pub fn start() -> Result<()> {
-    Stack::discover()?.compose(&["up", "-d", "--remove-orphans"])
+    let stack = Stack::discover()?;
+    let _lock = crate::storage::lock(&stack.install_dir)?;
+    stack.compose(&["up", "-d", "--wait", "--wait-timeout", "120"])
 }
 
 pub fn stop() -> Result<()> {
-    Stack::discover()?.compose(&["stop"])
+    let stack = Stack::discover()?;
+    let _lock = crate::storage::lock(&stack.install_dir)?;
+    stack.compose(&["stop"])
 }
 
 pub fn uninstall(purge: bool, yes: bool) -> Result<()> {
     let stack = Stack::discover()?;
+    let _lock = crate::storage::lock(&stack.install_dir)?;
     let envf = env(&stack)?;
     let ui_prompt = Ui::new(yes);
     let project = envf
@@ -447,7 +419,11 @@ pub fn version() -> Result<()> {
     let version = envf.get("VERSION").unwrap_or_default();
     ui::say(format!(
         "installed: {}",
-        if version.is_empty() { "unknown" } else { &version }
+        if version.is_empty() {
+            "unknown"
+        } else {
+            &version
+        }
     ));
     let _ = stack.compose(&["images"]);
     if let Ok(latest) = release::resolve_latest_version() {
@@ -458,9 +434,12 @@ pub fn version() -> Result<()> {
 
 /// Only remove the /usr/local/bin symlink when it points into this install.
 fn remove_bin_link(stack: &Stack) {
-    let link = std::path::Path::new(BIN_LINK);
-    if let Ok(target) = std::fs::read_link(link) {
-        if target == stack.install_dir.join("mintctl") {
+    let mut links = vec![PathBuf::from(BIN_LINK)];
+    if let Ok(link) = compose::cli_link() {
+        links.push(link);
+    }
+    for link in links {
+        if std::fs::read_link(&link).ok().as_deref() == Some(&stack.install_dir.join("mintctl")) {
             let _ = std::fs::remove_file(link);
         }
     }

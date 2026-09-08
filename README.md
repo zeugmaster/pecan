@@ -20,6 +20,12 @@ One command on a Linux server (amd64/arm64):
 curl -fsSL https://raw.githubusercontent.com/zeugmaster/pecan/main/install.sh | bash
 ```
 
+Run it as your normal user with access to Docker (including rootless Docker).
+It installs into `~/pecan` and links `~/.local/bin/mintctl`; add
+`~/.local/bin` to your `PATH` if needed. Root installs on Linux use
+`/opt/pecan` and `/usr/local/bin/mintctl`. Use `--dir` to choose another
+location. Docker Compose v2 with `up --wait-timeout` support is required.
+
 The guided installer asks what this server should run:
 
 - **Processor + a new mint** — pick a unit and the mint's hostname; the mint
@@ -52,6 +58,17 @@ and mint URL in the **Mint** tab, apply the generated snippet to your mintd
 ```text
 mintctl status | logs | update | domain | backup | restore | start | stop | uninstall
 ```
+
+```sh
+mintctl update --check          # preview a console update
+mintctl update                 # update console + processor, keeping the mint pin
+mintctl update --with-mint      # also use the release's tested mint version
+mintctl update --mint-version <tag>  # update only the bundled mint
+```
+
+Updates show the version changes, ask for confirmation (`--yes` for
+automation), and save a backup before applying them. Older installations can
+use the bootstrap update command in the [operations guide](docs/operations.md#updates-and-recovery).
 
 Backups, restore drills, server migration, proxy setups, and bundled-mint
 operations live in [`docs/operations.md`](docs/operations.md).

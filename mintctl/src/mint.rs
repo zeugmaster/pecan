@@ -111,28 +111,41 @@ allow_insecure = true
 /// Write `<install-dir>/mint/{config.toml,mnemonic}` with tight modes. The
 /// seed is never overwritten — a leftover mnemonic from a previous install
 /// is a hard error, not a silent replacement.
-pub fn write_mint_files(install_dir: &Path, unit: &str, mint_url: &str, mnemonic: &str) -> Result<()> {
+pub fn write_mint_files(
+    install_dir: &Path,
+    unit: &str,
+    mint_url: &str,
+    mnemonic: &str,
+) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let dir = install_dir.join("mint");
+    let seed_path = dir.join("mnemonic");
+    if seed_path.exists() {
+        bail!(
+            "{} already exists — refusing to overwrite a mint seed or configuration",
+            seed_path.display()
+        );
+    }
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
 
     let config_path = dir.join("config.toml");
-    std::fs::write(&config_path, render_config_toml(unit, mint_url))
-        .with_context(|| format!("write {}", config_path.display()))?;
-    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))?;
+    crate::storage::atomic_write(
+        &config_path,
+        render_config_toml(unit, mint_url).as_bytes(),
+        0o600,
+    )?;
 
-    let seed_path = dir.join("mnemonic");
-    if seed_path.exists() {
-        bail!(
-            "{} already exists — refusing to overwrite a mint seed. \
-             Move it away first if this really is a fresh install.",
-            seed_path.display()
-        );
-    }
     // No trailing newline: cdk's file: resolver reads the file verbatim.
-    std::fs::write(&seed_path, mnemonic).with_context(|| format!("write {}", seed_path.display()))?;
-    std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600))?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&seed_path)
+        .with_context(|| format!("create {}", seed_path.display()))?
+        .write_all(mnemonic.as_bytes())?;
     Ok(())
 }
 
@@ -176,10 +189,18 @@ mod tests {
     fn mint_files_written_with_modes_and_seed_never_overwritten() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
-        write_mint_files(dir.path(), "ora", "http://1.2.3.4:3338", "word ".repeat(12).trim())
-            .expect("write");
+        write_mint_files(
+            dir.path(),
+            "ora",
+            "http://1.2.3.4:3338",
+            "word ".repeat(12).trim(),
+        )
+        .expect("write");
         let seed_path = dir.path().join("mint/mnemonic");
-        let mode = std::fs::metadata(&seed_path).expect("meta").permissions().mode();
+        let mode = std::fs::metadata(&seed_path)
+            .expect("meta")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
         assert!(dir.path().join("mint/config.toml").is_file());
         // A second write must refuse to touch the seed.

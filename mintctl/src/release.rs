@@ -20,6 +20,41 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+/// Tags are also interpolated into Compose .env files and release URLs.
+pub fn validate_tag(tag: &str) -> Result<()> {
+    let valid = !tag.is_empty()
+        && tag.len() <= 128
+        && tag.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !valid {
+        bail!(
+            "invalid image/release tag {tag:?}; use letters, digits, dots, underscores and hyphens"
+        );
+    }
+    Ok(())
+}
+
+fn get(url: &str) -> Result<ureq::Response> {
+    for attempt in 0..3 {
+        match agent().get(url).call() {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let retry = matches!(
+                    &error,
+                    ureq::Error::Transport(_) | ureq::Error::Status(408 | 429 | 500..=599, _)
+                );
+                if !retry || attempt == 2 {
+                    return Err(error.into());
+                }
+                std::thread::sleep(Duration::from_secs(1 << attempt));
+            }
+        }
+    }
+    unreachable!()
+}
+
 /// Latest release tag: GitHub API first, then the /releases/latest redirect
 /// (which carries the tag in its final URL) when the API is rate-limited.
 pub fn resolve_latest_version() -> Result<String> {
@@ -67,10 +102,8 @@ impl ArtifactSource {
             }
             ArtifactSource::Ref(git_ref) => {
                 let url = format!("https://raw.githubusercontent.com/{REPO}/{git_ref}/{rel}");
-                let resp = agent()
-                    .get(&url)
-                    .call()
-                    .with_context(|| format!("could not download {rel} from {url}"))?;
+                let resp =
+                    get(&url).with_context(|| format!("could not download {rel} from {url}"))?;
                 let mut reader = resp.into_reader();
                 let mut file = std::fs::File::create(dest)
                     .with_context(|| format!("create {}", dest.display()))?;
@@ -101,12 +134,11 @@ pub fn binary_asset_name() -> Result<String> {
 /// it against the release's SHA256SUMS. Returns the temp path (same dir as
 /// `near`, so a later rename is atomic).
 pub fn download_release_binary(version: &str, near: &Path) -> Result<PathBuf> {
+    validate_tag(version)?;
     let asset = binary_asset_name()?;
     let base = format!("https://github.com/{REPO}/releases/download/{version}");
 
-    let sums = agent()
-        .get(&format!("{base}/SHA256SUMS"))
-        .call()
+    let sums = get(&format!("{base}/SHA256SUMS"))
         .with_context(|| format!("download SHA256SUMS for {version}"))?
         .into_string()?;
     let expected = sums
@@ -124,12 +156,9 @@ pub fn download_release_binary(version: &str, near: &Path) -> Result<PathBuf> {
         .prefix(".mintctl-download-")
         .tempfile_in(dir)
         .context("create download temp file")?;
-    let resp = agent()
-        .get(&format!("{base}/{asset}"))
-        .call()
+    let resp = get(&format!("{base}/{asset}"))
         .with_context(|| format!("download {asset} for {version}"))?;
-    std::io::copy(&mut resp.into_reader(), &mut tmp)
-        .with_context(|| format!("write {asset}"))?;
+    std::io::copy(&mut resp.into_reader(), &mut tmp).with_context(|| format!("write {asset}"))?;
 
     let bytes = std::fs::read(tmp.path())?;
     let actual = hex(&Sha256::digest(&bytes));
@@ -137,10 +166,7 @@ pub fn download_release_binary(version: &str, near: &Path) -> Result<PathBuf> {
         bail!("checksum mismatch for {asset}: expected {expected}, got {actual}");
     }
     let (_file, path) = tmp.keep().context("persist downloaded binary")?;
-    std::fs::set_permissions(
-        &path,
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )?;
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     Ok(path)
 }
 

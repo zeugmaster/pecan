@@ -23,7 +23,9 @@ mod ops;
 mod passphrase;
 mod preflight;
 mod release;
+mod storage;
 mod ui;
+mod update;
 mod wizard;
 
 #[derive(Parser)]
@@ -55,7 +57,7 @@ pub struct InstallArgs {
     /// ACME account email for certificate notices
     #[arg(long)]
     pub email: Option<String>,
-    /// Install directory (default /opt/pecan)
+    /// Install directory (root on Linux: /opt/pecan; otherwise ~/pecan)
     #[arg(long)]
     pub dir: Option<PathBuf>,
     /// Pin a release instead of resolving the latest
@@ -121,15 +123,20 @@ pub struct InstallArgs {
     pub no_pull: bool,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 pub struct UpdateArgs {
     /// Update to this release instead of the latest
     #[arg(long)]
     pub version: Option<String>,
-    /// Bundled-mint installs only: upgrade the mint image to this tag.
-    /// The mint is never updated implicitly — it holds money.
+    /// Update only the bundled mint to this tag; combine with --version to update both
     #[arg(long)]
     pub mint_version: Option<String>,
+    /// Also update the bundled mint to the target Pecan release's tested version
+    #[arg(long, conflicts_with = "mint_version")]
+    pub with_mint: bool,
+    /// Show the proposed versions without changing the installation
+    #[arg(long)]
+    pub check: bool,
     /// Non-interactive
     #[arg(long, short = 'y')]
     pub yes: bool,
@@ -175,10 +182,8 @@ enum Command {
     /// Containers, console health, versions
     Status,
     /// Follow service logs (optionally: processor, caddy, mintd)
-    Logs {
-        services: Vec<String>,
-    },
-    /// Update artifacts + image to a release (default: latest)
+    Logs { services: Vec<String> },
+    /// Update the console; --with-mint includes the bundled mint
     Update(UpdateArgs),
     /// Archive the processor volumes and .env into a tar.gz (stops services briefly)
     Backup {
@@ -218,7 +223,7 @@ fn main() {
         Some(Command::Domain(args)) => wizard::domain_command(&args),
         Some(Command::Status) => ops::status(),
         Some(Command::Logs { services }) => ops::logs(&services),
-        Some(Command::Update(args)) => ops::update(&args),
+        Some(Command::Update(args)) => update::run(&args),
         Some(Command::Backup { output }) => ops::backup(output),
         Some(Command::Restore { archive, yes }) => ops::restore(archive, yes),
         Some(Command::Start) => ops::start(),

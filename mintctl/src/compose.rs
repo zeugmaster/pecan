@@ -6,10 +6,22 @@ use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 
+use crate::envfile::EnvFile;
 use crate::ui;
 
 pub const BIN_LINK: &str = "/usr/local/bin/mintctl";
 pub const DEFAULT_LINUX_DIR: &str = "/opt/pecan";
+
+pub fn cli_link() -> Result<PathBuf> {
+    if is_root() {
+        Ok(PathBuf::from(BIN_LINK))
+    } else {
+        Ok(
+            PathBuf::from(std::env::var("HOME").context("HOME is not set")?)
+                .join(".local/bin/mintctl"),
+        )
+    }
+}
 
 /// An existing installation (subcommand context): the directory holding
 /// docker-compose.yml, .env, and the mintctl binary itself.
@@ -37,6 +49,8 @@ impl Stack {
                 install_dir.display()
             );
         }
+        let install_dir =
+            std::fs::canonicalize(install_dir).context("resolve install directory")?;
         Ok(Self { install_dir })
     }
 
@@ -47,7 +61,10 @@ impl Stack {
     /// `docker compose` pinned to this install's compose file and project dir
     /// (never auto-loads overrides), streaming output to the terminal.
     pub fn compose(&self, args: &[&str]) -> Result<()> {
-        let status = self.compose_command(args).status().context("run docker compose")?;
+        let status = self
+            .compose_command(args)?
+            .status()
+            .context("run docker compose")?;
         if !status.success() {
             bail!("docker compose {} failed", args.join(" "));
         }
@@ -58,7 +75,7 @@ impl Stack {
     /// which case the tail of the combined output rides along in the error.
     pub fn compose_quiet(&self, args: &[&str]) -> Result<()> {
         let output = self
-            .compose_command(args)
+            .compose_command(args)?
             .output()
             .context("run docker compose")?;
         if output.status.success() {
@@ -84,15 +101,36 @@ impl Stack {
         );
     }
 
-    fn compose_command(&self, args: &[&str]) -> Command {
+    pub fn compose_command(&self, args: &[&str]) -> Result<Command> {
+        self.command_with_files(&self.install_dir, args)
+    }
+
+    /// Stage artifacts elsewhere while resolving mounts and volumes against
+    /// the original project. The install's .env wins over the caller's shell.
+    pub fn command_with_files(&self, files: &Path, args: &[&str]) -> Result<Command> {
+        let env = EnvFile::load(&files.join(".env"))?;
         let mut cmd = Command::new("docker");
         cmd.arg("compose")
             .arg("-f")
-            .arg(self.install_dir.join("docker-compose.yml"))
+            .arg(files.join("docker-compose.yml"))
+            .arg("--env-file")
+            .arg(files.join(".env"))
             .arg("--project-directory")
             .arg(&self.install_dir)
+            .arg("--project-name")
+            .arg(
+                env.get("COMPOSE_PROJECT_NAME")
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| project_name(&self.install_dir)),
+            )
+            .current_dir(&self.install_dir)
+            .env_remove("COMPOSE_PROFILES")
+            .env_remove("COMPOSE_FILE")
             .args(args);
-        cmd
+        for key in env.keys() {
+            cmd.env_remove(key);
+        }
+        Ok(cmd)
     }
 }
 
@@ -102,7 +140,8 @@ pub fn project_name(install_dir: &Path) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_else(|| "pecan".into());
-    base.chars()
+    let name: String = base
+        .chars()
         .map(|c| {
             if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
                 c
@@ -110,7 +149,29 @@ pub fn project_name(install_dir: &Path) -> String {
                 '-'
             }
         })
-        .collect()
+        .collect();
+    let name = name.trim_start_matches(['-', '_']);
+    if name.is_empty() {
+        "pecan".into()
+    } else {
+        name.into()
+    }
+}
+
+/// New installations include a path suffix: two users can both install into
+/// ~/pecan on a shared daemon without sharing named volumes. Existing projects
+/// retain the COMPOSE_PROJECT_NAME already recorded in their .env.
+pub fn install_project_name(install_dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(install_dir.as_os_str().as_encoded_bytes());
+    format!(
+        "{}-{:02x}{:02x}{:02x}{:02x}",
+        project_name(install_dir),
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3]
+    )
 }
 
 /// Whether an image reference exists in the local daemon (docker image
@@ -156,7 +217,7 @@ pub fn compose_v2_available() -> bool {
         .unwrap_or(false)
 }
 
-fn is_root() -> bool {
+pub fn is_root() -> bool {
     // Effective uid without a libc dependency: id -u is POSIX.
     Command::new("id")
         .arg("-u")
@@ -178,9 +239,31 @@ pub fn ensure_docker(allow_install: bool) -> Result<()> {
             );
         }
         if allow_install {
+            if !is_root() {
+                bail!("--install-docker installs system Docker and needs root. Install rootless Docker first (https://docs.docker.com/engine/security/rootless/), or ask an administrator to install Docker and grant this user access, then re-run mintctl as this user.");
+            }
             ui::say("Docker is not installed — installing via https://get.docker.com ...");
+            let installer = tempfile::NamedTempFile::new()?;
+            let download = Command::new("curl")
+                .args([
+                    "-fsSL",
+                    "--retry",
+                    "3",
+                    "--connect-timeout",
+                    "15",
+                    "--max-time",
+                    "120",
+                    "https://get.docker.com",
+                    "-o",
+                ])
+                .arg(installer.path())
+                .status()
+                .context("download Docker installer")?;
+            if !download.success() {
+                bail!("could not download Docker installer; nothing was executed");
+            }
             let status = Command::new("sh")
-                .args(["-c", "curl -fsSL https://get.docker.com | sh"])
+                .arg(installer.path())
                 .status()
                 .context("run the Docker convenience installer")?;
             if !status.success() {
@@ -196,8 +279,8 @@ pub fn ensure_docker(allow_install: bool) -> Result<()> {
     if !docker_daemon_running() {
         if !is_root() && !cfg!(target_os = "macos") {
             bail!(
-                "cannot talk to the Docker daemon. Re-run as root \
-                 (curl ... | sudo bash) or add this user to the docker group."
+                "cannot talk to the Docker daemon as this user. Start your rootless Docker daemon \
+                 or ask an administrator for Docker access (then log in again). Check 'docker context show' and 'docker info'."
             );
         }
         bail!("the Docker daemon is not responding. Is it running?");
@@ -207,6 +290,12 @@ pub fn ensure_docker(allow_install: bool) -> Result<()> {
             "Docker Compose v2 is required (the 'docker compose' plugin). \
              Install docker-compose-plugin and re-run."
         );
+    }
+    let help = Command::new("docker")
+        .args(["compose", "up", "--help"])
+        .output()?;
+    if !help.status.success() || !String::from_utf8_lossy(&help.stdout).contains("--wait-timeout") {
+        bail!("Docker Compose is too old: upgrade the Compose v2 plugin to a version supporting 'up --wait --wait-timeout' before continuing");
     }
     Ok(())
 }
@@ -317,6 +406,9 @@ mod tests {
     fn project_name_sanitizes_like_bash() {
         assert_eq!(project_name(Path::new("/opt/pecan")), "pecan");
         assert_eq!(project_name(Path::new("/srv/My Mint!")), "my-mint-");
-        assert_eq!(project_name(Path::new("/x/under_score.dot")), "under_score-dot");
+        assert_eq!(
+            project_name(Path::new("/x/under_score.dot")),
+            "under_score-dot"
+        );
     }
 }

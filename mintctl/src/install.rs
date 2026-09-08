@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use time::format_description::well_known::Rfc3339;
 
 use crate::caddy;
-use crate::compose::{self, Stack, BIN_LINK, DEFAULT_LINUX_DIR};
+use crate::compose::{self, Stack, DEFAULT_LINUX_DIR};
 use crate::dns;
 use crate::mint;
 use crate::passphrase;
@@ -39,6 +39,7 @@ pub enum AccessMode {
 /// The console's Mint-tab attachment pre-seeded at first boot (bundled
 /// installs and headless --unit/--mint-url attaches). Lands in .env as the
 /// INITIAL_* keys the processor consumes only while no setup.json exists.
+#[derive(Clone)]
 pub struct AttachPlan {
     pub unit: String,
     pub mint_url: String,
@@ -47,6 +48,7 @@ pub struct AttachPlan {
 }
 
 /// A bundled mint (compose profile "mint", official cashubtc/mintd image).
+#[derive(Clone)]
 pub struct MintPlan {
     /// Public hostname (empty in plain-HTTP mode).
     pub mint_domain: String,
@@ -64,6 +66,7 @@ pub struct MintPlan {
     pub mnemonic: String,
 }
 
+#[derive(Clone)]
 pub struct InstallPlan {
     pub install_dir: PathBuf,
     pub version: String,
@@ -101,7 +104,10 @@ impl InstallPlan {
     /// Whether the Caddyfile carries the mint site block ({$MINT_DOMAIN}).
     pub fn mint_site_enabled(&self) -> bool {
         self.access == AccessMode::DomainTls
-            && self.mint.as_ref().is_some_and(|m| !m.mint_domain.is_empty())
+            && self
+                .mint
+                .as_ref()
+                .is_some_and(|m| !m.mint_domain.is_empty())
     }
 
     pub fn console_url(&self) -> String {
@@ -135,7 +141,6 @@ fn run_noninteractive(args: &InstallArgs) -> Result<()> {
     preflight_platform()?;
     let install_dir = resolve_install_dir(args.dir.clone())?;
     compose::ensure_docker(args.install_docker)?;
-    guard_fresh_dir(&install_dir)?;
 
     let version = match &args.version {
         Some(v) => v.clone(),
@@ -144,7 +149,11 @@ fn run_noninteractive(args: &InstallArgs) -> Result<()> {
             release::resolve_latest_version()?
         }
     };
-    let source = artifact_source(args.artifacts_dir.clone(), args.artifact_ref.clone(), &version);
+    let source = artifact_source(
+        args.artifacts_dir.clone(),
+        args.artifact_ref.clone(),
+        &version,
+    );
 
     let plan = plan_from_flags(args, install_dir, version)?;
     if plan.no_pull {
@@ -152,6 +161,8 @@ fn run_noninteractive(args: &InstallArgs) -> Result<()> {
         // leave a half-finished install behind.
         ensure_local_image(&plan.version)?;
     }
+    guard_fresh_dir(&plan.install_dir)?;
+    let _lock = crate::storage::lock(&plan.install_dir)?;
     warn_on_unconfirmed_dns(&plan);
 
     ui::say(format!(
@@ -160,9 +171,7 @@ fn run_noninteractive(args: &InstallArgs) -> Result<()> {
         if plan.mint.is_some() { " + mint" } else { "" },
         plan.install_dir.display()
     ));
-    fetch_deploy_artifacts(&source, &plan.install_dir)?;
-    install_binary(&source, &plan.version, &plan.install_dir.join("mintctl"))?;
-    write_config(&plan)?;
+    prepare_install(&source, &plan)?;
 
     let stack = Stack {
         install_dir: plan.install_dir.clone(),
@@ -181,28 +190,16 @@ fn run_noninteractive(args: &InstallArgs) -> Result<()> {
         ui::say("Validating the mint configuration ...");
         validate_mint_config(&stack)?;
     }
-    stack.compose(&["up", "-d", "--remove-orphans"])?;
+    stack.compose(&[
+        "up",
+        "-d",
+        "--pull",
+        "never",
+        "--wait",
+        "--wait-timeout",
+        "120",
+    ])?;
 
-    ui::say("Waiting for the operator console to come up ...");
-    if !compose::wait_healthy(plan.ui_port, Duration::from_secs(120)) {
-        let _ = stack.compose(&["ps"]);
-        bail!(
-            "the console did not become healthy within 2 minutes — check '{}/mintctl logs processor'",
-            plan.install_dir.display()
-        );
-    }
-    if let Some(mint_plan) = &plan.mint {
-        ui::say("Waiting for the mint to come up ...");
-        let url = format!("http://127.0.0.1:{}/v1/info", mint_plan.mint_port);
-        if !compose::wait_http_ok(&url, Duration::from_secs(120)) {
-            let _ = stack.compose(&["ps"]);
-            bail!(
-                "the mint did not come up within 2 minutes — check '{}/mintctl logs mintd'",
-                plan.install_dir.display()
-            );
-        }
-    }
-    install_cli_symlink(&plan.install_dir);
     print_summary(&plan);
     Ok(())
 }
@@ -258,7 +255,11 @@ fn warn_on_unconfirmed_dns(plan: &InstallPlan) {
 /// Resolve the full plan from flags alone (no prompts). Port conflicts are
 /// fatal here — headless installs must fail fast with the remedy flag named,
 /// not later at `docker compose up`.
-fn plan_from_flags(args: &InstallArgs, install_dir: PathBuf, version: String) -> Result<InstallPlan> {
+fn plan_from_flags(
+    args: &InstallArgs,
+    install_dir: PathBuf,
+    version: String,
+) -> Result<InstallPlan> {
     let console_domain = args.console_domain.clone().unwrap_or_default();
     if !console_domain.is_empty() && !dns::valid_hostname(&console_domain) {
         bail!(
@@ -344,7 +345,9 @@ fn plan_from_flags(args: &InstallArgs, install_dir: PathBuf, version: String) ->
     } else if let Some(unit) = unit {
         // Pre-attach an existing mint headlessly.
         let mint_url = args.mint_url.clone().ok_or_else(|| {
-            anyhow::anyhow!("--unit without --with-mint needs --mint-url: the existing mint's public URL")
+            anyhow::anyhow!(
+                "--unit without --with-mint needs --mint-url: the existing mint's public URL"
+            )
         })?;
         let grpc_bind = args.grpc_bind.as_deref().unwrap_or("127.0.0.1");
         let advertised = match &args.advertised_grpc {
@@ -436,42 +439,138 @@ fn plan_from_flags(args: &InstallArgs, install_dir: PathBuf, version: String) ->
 pub fn preflight_platform() -> Result<()> {
     match std::env::consts::ARCH {
         "x86_64" | "aarch64" => {}
-        other => bail!("unsupported architecture {other}; images are published for amd64 and arm64"),
+        other => {
+            bail!("unsupported architecture {other}; images are published for amd64 and arm64")
+        }
     }
     match std::env::consts::OS {
         "linux" => {}
-        "macos" => ui::warn("macOS detected — fine for development and testing, not for production."),
+        "macos" => {
+            ui::warn("macOS detected — fine for development and testing, not for production.")
+        }
         other => bail!("unsupported platform: {other}"),
     }
     Ok(())
 }
 
 pub fn resolve_install_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(dir) = explicit {
-        return Ok(dir);
+    let dir = match explicit {
+        Some(dir) => dir,
+        None => default_install_dir(
+            compose::is_root() && cfg!(target_os = "linux"),
+            std::env::var_os("HOME").as_deref(),
+        )?,
+    };
+    if dir.as_os_str().is_empty() {
+        bail!("--dir cannot be empty");
     }
-    if cfg!(target_os = "macos") {
-        let home = std::env::var("HOME").context("HOME is not set")?;
-        Ok(PathBuf::from(home).join("pecan"))
+    let dir = if dir.is_absolute() {
+        dir
     } else {
-        Ok(PathBuf::from(DEFAULT_LINUX_DIR))
+        std::env::current_dir()?.join(dir)
+    };
+    Ok(std::fs::canonicalize(&dir).unwrap_or(dir))
+}
+
+fn default_install_dir(system: bool, user_home: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    if system {
+        return Ok(PathBuf::from(DEFAULT_LINUX_DIR));
     }
+    let path = PathBuf::from(user_home.context("HOME is not set; pass --dir")?);
+    if !path.is_absolute() {
+        bail!("HOME must be an absolute path; pass --dir");
+    }
+    Ok(path.join("pecan"))
 }
 
 pub fn guard_fresh_dir(install_dir: &Path) -> Result<()> {
-    if install_dir.join(".env").is_file() {
+    if install_dir.join(".env").exists() {
         bail!(
-            "an installation already exists in {dir} — use '{dir}/mintctl status' or \
-             '{dir}/mintctl update'. (For a second instance, re-run with --dir and different ports.)",
+            "an installation already exists in {dir} — use '{dir}/mintctl start' to resume a failed install, \
+             or '{dir}/mintctl update' to update. Credentials are in .env; a bundled mint's seed is in mint/mnemonic. \
+             For a second instance, pass --dir and different ports.",
             dir = install_dir.display()
+        );
+    }
+    if install_dir.join("mint").exists() {
+        bail!(
+            "{} contains mint data from an earlier install; recover it before reinstalling",
+            install_dir.display()
         );
     }
     std::fs::create_dir_all(install_dir).with_context(|| {
         format!(
-            "cannot create {} — re-run as root (curl ... | sudo bash) or pass --dir somewhere writable",
+            "cannot create {} — pass --dir somewhere writable by this user",
             install_dir.display()
         )
-    })
+    })?;
+    tempfile::NamedTempFile::new_in(install_dir)
+        .with_context(|| format!("{} is not writable by this user", install_dir.display()))?;
+    Ok(())
+}
+
+/// Downloads finish before credentials are committed. After configuration is
+/// written, failures can be resumed with mintctl start without changing seeds.
+pub fn prepare_install(source: &ArtifactSource, plan: &InstallPlan) -> Result<()> {
+    // Recheck under the operation lock, after any concurrent installer exits.
+    guard_fresh_dir(&plan.install_dir)?;
+    release::validate_tag(&plan.version)?;
+    let mut ports = vec![plan.ui_port, plan.grpc_port];
+    if let Some(mint) = &plan.mint {
+        ports.push(mint.mint_port);
+    }
+    if plan.access == AccessMode::DomainTls {
+        ports.extend([80, 443]);
+    }
+    if ports.contains(&0) {
+        bail!("host ports must be between 1 and 65535");
+    }
+    let mut unique = ports.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != ports.len() {
+        bail!("each service needs a distinct host port");
+    }
+    preflight::check_rootless_ports(&ports)?;
+    if let Some(mint) = &plan.mint {
+        release::validate_tag(&mint.mintd_version)?;
+    }
+    let staging = tempfile::tempdir_in(&plan.install_dir)?;
+    fetch_deploy_artifacts(source, staging.path())?;
+    install_binary(source, &plan.version, &staging.path().join("mintctl"))?;
+    let mut staged_plan = plan.clone();
+    staged_plan.install_dir = staging.path().to_path_buf();
+    write_config(&staged_plan)?;
+    let mut env = crate::envfile::EnvFile::load(&staging.path().join(".env"))?;
+    env.set(
+        "COMPOSE_PROJECT_NAME",
+        &compose::install_project_name(&plan.install_dir),
+    );
+    env.save()?;
+    let stack = Stack {
+        install_dir: plan.install_dir.clone(),
+    };
+    let status = stack
+        .command_with_files(staging.path(), &["config", "--quiet"])?
+        .status()?;
+    if !status.success() {
+        bail!("invalid deployment configuration; installation was not committed");
+    }
+    for name in [
+        "docker-compose.yml",
+        "Caddyfile",
+        ".env.example",
+        "mintctl",
+        "mint",
+        "proxy-snippets",
+        ".env",
+    ] {
+        if staging.path().join(name).exists() {
+            std::fs::rename(staging.path().join(name), plan.install_dir.join(name))?;
+        }
+    }
+    install_cli_symlink(&plan.install_dir);
+    Ok(())
 }
 
 pub fn artifact_source(
@@ -501,27 +600,18 @@ pub fn fetch_deploy_artifacts(source: &ArtifactSource, dest_dir: &Path) -> Resul
 
 /// Put the pinned release's mintctl at `dest`. Self-copy when we ARE that
 /// release (or in offline test rigs); otherwise download + verify the asset,
-/// falling back to self-copy so an install never ends up without a mintctl.
+/// failing closed if the target binary cannot be downloaded or verified.
 pub fn install_binary(source: &ArtifactSource, version: &str, dest: &Path) -> Result<()> {
     let own = std::env::current_exe().context("resolve this binary's path")?;
     let self_copy = release::own_version() == version || matches!(source, ArtifactSource::Dir(_));
     if !self_copy {
-        match release::download_release_binary(version, dest) {
-            Ok(tmp) => {
-                std::fs::rename(&tmp, dest)
-                    .with_context(|| format!("install mintctl at {}", dest.display()))?;
-                return Ok(());
-            }
-            Err(e) => ui::warn(format!(
-                "could not download the {version} mintctl binary ({e}); \
-                 installing this running copy ({}) instead",
-                release::own_version()
-            )),
-        }
+        let tmp = release::download_release_binary(version, dest)?;
+        std::fs::rename(&tmp, dest)
+            .with_context(|| format!("install mintctl at {}", dest.display()))?;
+        return Ok(());
     }
     if std::fs::canonicalize(&own).ok() != std::fs::canonicalize(dest).ok() {
-        std::fs::copy(&own, dest)
-            .with_context(|| format!("copy mintctl to {}", dest.display()))?;
+        std::fs::copy(&own, dest).with_context(|| format!("copy mintctl to {}", dest.display()))?;
     }
     std::fs::set_permissions(dest, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     Ok(())
@@ -578,10 +668,40 @@ pub fn pull_image(stack: &Stack) -> Result<()> {
 }
 
 pub fn install_cli_symlink(install_dir: &Path) {
-    let target = install_dir.join("mintctl");
-    let _ = std::fs::remove_file(BIN_LINK);
-    if std::os::unix::fs::symlink(&target, BIN_LINK).is_ok() {
-        ui::note(format!("installed the management CLI as {BIN_LINK}"));
+    let result = (|| -> Result<()> {
+        let link = compose::cli_link()?;
+        std::fs::create_dir_all(link.parent().context("CLI link has no parent")?)?;
+        let target = std::fs::canonicalize(install_dir)?.join("mintctl");
+        if let Ok(existing) = std::fs::read_link(&link) {
+            if existing == target {
+                return Ok(());
+            }
+        }
+        // symlink fails if ANY file already exists: a second install never
+        // silently hijacks another installation's management command.
+        std::os::unix::fs::symlink(&target, &link).with_context(|| {
+            format!(
+                "cannot create {} (an existing command is kept)",
+                link.display()
+            )
+        })?;
+        ui::note(format!(
+            "installed the management CLI as {}",
+            link.display()
+        ));
+        let on_path = std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|dir| Some(dir.as_path()) == link.parent())
+        });
+        if !on_path {
+            ui::note("Add $HOME/.local/bin to PATH: export PATH=\"$HOME/.local/bin:$PATH\"");
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        ui::warn(format!(
+            "{e:#}; use {}/mintctl directly",
+            install_dir.display()
+        ));
     }
 }
 
@@ -628,7 +748,7 @@ fn write_env(plan: &InstallPlan) -> Result<()> {
          INITIAL_ADMIN_PASSWORD={admin_password}\n\
          ACME_EMAIL={acme_email}\n",
         version = plan.version,
-        project = compose::project_name(&plan.install_dir),
+        project = compose::install_project_name(&plan.install_dir),
         ui_port = plan.ui_port,
         bind = plan.bind_addr,
         compose_profiles = plan.compose_profiles(),
@@ -666,8 +786,7 @@ fn write_env(plan: &InstallPlan) -> Result<()> {
         ));
     }
     let env_path = plan.install_dir.join(".env");
-    std::fs::write(&env_path, body).with_context(|| format!("write {}", env_path.display()))?;
-    std::fs::set_permissions(&env_path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    crate::storage::atomic_write(&env_path, body.as_bytes(), 0o600)?;
     Ok(())
 }
 
@@ -755,7 +874,10 @@ fn print_summary(plan: &InstallPlan) {
         ));
         say("");
     }
-    say(format!("  Sign in:           admin / {}", plan.admin_password));
+    say(format!(
+        "  Sign in:           admin / {}",
+        plan.admin_password
+    ));
     say(format!(
         "                     (also stored in {}/.env)",
         plan.install_dir.display()
@@ -814,4 +936,39 @@ fn print_summary(plan: &InstallPlan) {
     say("  Manage with: mintctl status | logs | update | backup | restore |");
     say("               start | stop | uninstall");
     say("============================================================");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn default_paths_support_root_and_unprivileged_users() {
+        assert_eq!(
+            default_install_dir(true, None).unwrap(),
+            PathBuf::from("/opt/pecan")
+        );
+        assert_eq!(
+            default_install_dir(false, Some(std::ffi::OsStr::new("/home/operator"))).unwrap(),
+            PathBuf::from("/home/operator/pecan")
+        );
+        assert!(default_install_dir(false, None).is_err());
+        assert!(default_install_dir(false, Some(std::ffi::OsStr::new("relative"))).is_err());
+    }
+    #[test]
+    fn installs_with_the_same_basename_do_not_share_volumes() {
+        assert_ne!(
+            compose::install_project_name(Path::new("/home/alice/pecan")),
+            compose::install_project_name(Path::new("/home/bob/pecan"))
+        );
+    }
+    #[test]
+    fn fresh_install_refuses_existing_credentials_or_mint_material() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("mint")).unwrap();
+        assert!(guard_fresh_dir(dir.path()).is_err());
+        std::fs::remove_dir(dir.path().join("mint")).unwrap();
+        std::fs::write(dir.path().join(".env"), "VERSION=v1").unwrap();
+        let error = guard_fresh_dir(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("start"));
+    }
 }

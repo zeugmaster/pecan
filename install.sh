@@ -13,15 +13,21 @@
 #
 # Compatibility shim: releases up to the bash-only installer fetched this
 # file as their `mintctl`. When invoked that way (a .env sits next to this
-# script), it upgrades itself to the pinned release's binary in place and
+# script), it upgrades itself to the latest release's binary in place and
 # re-executes with the original arguments.
 #
 # Testing overrides:
 #   MINTCTL_LOCAL_BIN=/path/to/mintctl   use a local binary, skip the download
 
 set -euo pipefail
+umask 077
 
 REPO="zeugmaster/pecan"
+BOOTSTRAP_TMP=""
+cleanup() { if [ -n "$BOOTSTRAP_TMP" ]; then rm -rf "$BOOTSTRAP_TMP"; fi; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 say() { printf '%s\n' "$*"; }
 die() {
@@ -31,9 +37,9 @@ die() {
 
 fetch() { # url dest
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 120 "$1" -o "$2"
+        curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 "$1" -o "$2"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -T 120 -O "$2" "$1"
+        wget -q -t 3 -T 120 -O "$2" "$1"
     else
         die "curl or wget is required"
     fi
@@ -41,9 +47,9 @@ fetch() { # url dest
 
 fetch_stdout() { # url
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 15 "$1"
+        curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 "$1"
     else
-        wget -q -T 15 -O - "$1"
+        wget -q -t 3 -T 30 -O - "$1"
     fi
 }
 
@@ -89,10 +95,14 @@ resolve_latest_version() {
 # Peek at the args for a --version pin without consuming anything.
 version_from_args() {
     while [ $# -gt 0 ]; do
-        if [ "$1" = "--version" ] && [ $# -ge 2 ]; then
-            printf '%s' "$2"
-            return 0
-        fi
+        case "$1" in
+            --version)
+                [ $# -ge 2 ] && [ -n "$2" ] || die "--version needs a release tag"
+                printf '%s' "$2"; return 0 ;;
+            --version=*)
+                [ -n "${1#*=}" ] || die "--version needs a release tag"
+                printf '%s' "${1#*=}"; return 0 ;;
+        esac
         shift
     done
     printf ''
@@ -113,6 +123,7 @@ resolve_script_path() {
 # Download the release's mintctl binary into $1, verified against SHA256SUMS.
 download_binary() { # dest version
     local dest=$1 version=$2 asset sums expected actual
+    [[ "$version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || die "invalid release tag: $version"
     asset=$(asset_name)
     local base="https://github.com/${REPO}/releases/download/${version}"
     say "Downloading mintctl ${version} (${asset}) ..." >&2
@@ -139,25 +150,32 @@ main() {
     script_dir=$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P) || script_dir=""
 
     # Shim mode: an old install's `mintctl update` replaced its bash mintctl
-    # with this bootstrap. Upgrade in place to that install's pinned binary,
+    # with this bootstrap. Upgrade in place to the current management binary,
     # then re-exec with the original arguments.
-    if [ -n "$script_dir" ] && [ -f "$script_dir/.env" ] && [ -f "$script_path" ]; then
-        version=$(sed -n 's/^VERSION=//p' "$script_dir/.env" | tail -n 1)
-        [ -n "$version" ] || version=$(resolve_latest_version)
+    if [ "$(basename "$script_path")" = "mintctl" ] && [ -n "$script_dir" ] && [ -f "$script_dir/.env" ] && [ -f "$script_path" ]; then
+        # Old releases may predate binary assets. Bootstrap the current CLI;
+        # it discovers and preserves the installed stack's version pins.
+        version=$(resolve_latest_version)
         [ -n "$version" ] || die "could not resolve a release for the mintctl binary"
-        local staged="$script_dir/.mintctl.download.$$"
+        BOOTSTRAP_TMP=$(mktemp -d "$script_dir/.mintctl-download.XXXXXX")
+        local staged="$BOOTSTRAP_TMP/mintctl"
         if [ -n "${MINTCTL_LOCAL_BIN:-}" ]; then
             cp "$MINTCTL_LOCAL_BIN" "$staged" && chmod 0755 "$staged"
         else
             download_binary "$staged" "$version"
         fi
         mv "$staged" "$script_path"
+        cleanup
+        BOOTSTRAP_TMP=""
         exec "$script_path" "$@"
     fi
 
     # Fresh install: fetch the binary to a temp dir and hand over; mintctl
     # itself copies the pinned binary into the install directory.
-    local pinned
+    local pinned operation=install
+    case "${1:-}" in
+        install | update) operation=$1; shift ;;
+    esac
     pinned=$(version_from_args "$@")
     version=$pinned
     if [ -z "$version" ]; then
@@ -165,21 +183,19 @@ main() {
         version=$(resolve_latest_version)
         [ -n "$version" ] || die "could not resolve the latest release from GitHub. Pass --version vX.Y.Z."
     fi
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    trap 'rm -rf "$tmp_dir"' EXIT
+    BOOTSTRAP_TMP=$(mktemp -d)
     if [ -n "${MINTCTL_LOCAL_BIN:-}" ]; then
-        cp "$MINTCTL_LOCAL_BIN" "$tmp_dir/mintctl" && chmod 0755 "$tmp_dir/mintctl"
+        cp "$MINTCTL_LOCAL_BIN" "$BOOTSTRAP_TMP/mintctl" && chmod 0755 "$BOOTSTRAP_TMP/mintctl"
     else
-        download_binary "$tmp_dir/mintctl" "$version"
+        download_binary "$BOOTSTRAP_TMP/mintctl" "$version"
     fi
     # The stack pin travels as --version unless the caller already passed one.
-    local -a cmd=("$tmp_dir/mintctl" install)
-    if [ -z "$pinned" ]; then
+    local -a cmd=("$BOOTSTRAP_TMP/mintctl" "$operation")
+    if [ -z "$pinned" ] && [ "$operation" = install ]; then
         cmd+=(--version "$version")
     fi
     # Reattach the terminal for the guided installer; automation uses --yes.
-    if [ -r /dev/tty ]; then
+    if { true </dev/tty; } 2>/dev/null; then
         "${cmd[@]}" "$@" </dev/tty
     else
         "${cmd[@]}" "$@"

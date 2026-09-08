@@ -17,8 +17,8 @@ pub struct EnvFile {
 
 impl EnvFile {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Ok(Self {
             path: path.to_path_buf(),
             lines: raw.lines().map(str::to_string).collect(),
@@ -40,20 +40,21 @@ impl EnvFile {
         self.lines.push(format!("{key}={value}"));
     }
 
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.lines
+            .iter()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key))
+            .filter(|key| !key.starts_with('#'))
+    }
+
     /// Write back via temp file + rename, preserving the original's mode.
     pub fn save(&self) -> Result<()> {
         let mode = std::fs::metadata(&self.path)
             .map(|m| std::os::unix::fs::MetadataExt::mode(&m))
             .unwrap_or(0o600);
-        let tmp = self.path.with_extension(format!("tmp.{}", std::process::id()));
         let mut body = self.lines.join("\n");
         body.push('\n');
-        std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(mode & 0o777))
-            .with_context(|| format!("chmod {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("replace {}", self.path.display()))?;
-        Ok(())
+        crate::storage::atomic_write(&self.path, body.as_bytes(), mode & 0o777)
     }
 }
 
