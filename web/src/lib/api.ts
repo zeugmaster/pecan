@@ -6,7 +6,14 @@ export interface KeysetEntry {
   unit: string
   active: boolean
   input_fee_ppk: number
+  /** Unix seconds after which the mint refuses this keyset's ecash. */
   final_expiry?: number | null
+  /** When this processor first saw the keyset in the mint's list. */
+  first_seen_at?: number | null
+  /** False when the keyset predates the processor's first look at the mint. */
+  start_observed: boolean
+  /** When the keyset was seen to stop issuing (go inactive). */
+  deactivated_at?: number | null
 }
 
 export type CheckStatus = "ok" | "warn" | "fail" | "unknown"
@@ -85,6 +92,11 @@ export interface Ticket {
   created_at: number
   paid_at?: number | null
   expires_at?: number | null
+  voided_at?: number | null
+  /** Settled or voided: when the ticket left the open list. */
+  closed_at: number
+  /** The console user who settled or voided it. */
+  operator?: string | null
   description?: string | null
   notes?: string | null
 }
@@ -106,13 +118,24 @@ export interface OpenQuoteSummary {
   expires_at?: number | null
 }
 
-export interface CirculationPoint {
-  ts: number
-  ticket_id: string
-  kind: TicketKind
-  amount: number
-  delta: number
+/** One calendar day (viewer-local) of settled activity for the unit. */
+export interface CirculationDay {
+  /** Unix seconds of the day's local midnight. */
+  start: number
+  deposits: number
+  deposit_count: number
+  payouts: number
+  payout_count: number
+  /** Net settled since the beginning, at the end of the day. */
   circulation: number
+}
+
+export interface SettledSummary {
+  mint_count: number
+  melt_count: number
+  minted_amount: number
+  melted_amount: number
+  net_issued: number
 }
 
 export interface UserEntry {
@@ -138,14 +161,7 @@ export interface AppSnapshot {
   /** The configured unit's keysets at the mint (read-only). */
   keysets: KeysetEntry[]
   keysets_error?: string | null
-  summary: {
-    mint_count: number
-    melt_count: number
-    minted_amount: number
-    melted_amount: number
-    net_issued: number
-  }
-  circulation: CirculationPoint[]
+  summary: SettledSummary
   open_quotes: OpenQuoteSummary[]
   recent_done: Ticket[]
   /** One-time notice: this install previously managed its own mint. */
@@ -241,6 +257,60 @@ export function markFailed(ticketId: string, notes?: string) {
   return post<Ticket>(`/api/tickets/${encodeURIComponent(ticketId)}/mark-failed`, {
     notes: notes ?? "",
   })
+}
+
+// ---- settled history & circulation ----
+
+export interface HistoryFilters {
+  kind?: TicketKind
+  status?: "paid" | "failed"
+  /** Ticket or quote id fragment, note text, or operator. */
+  q?: string
+  /** Closed at or after (unix seconds). */
+  from?: number
+  /** Closed before (unix seconds). */
+  to?: number
+}
+
+export interface HistoryPage {
+  tickets: Ticket[]
+  total: number
+  offset: number
+  limit: number
+  /** Paid totals over every row matching the filters. */
+  summary: SettledSummary
+}
+
+function historyParams(filters: HistoryFilters) {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== "") params.set(key, String(value))
+  }
+  return params
+}
+
+/** Settled and voided tickets, newest first. Open quotes never appear. */
+export function fetchHistory(filters: HistoryFilters, offset: number, limit: number) {
+  const params = historyParams(filters)
+  params.set("offset", String(offset))
+  params.set("limit", String(limit))
+  return requestJson<HistoryPage>(`/api/tickets?${params}`)
+}
+
+/** Download URL for the same filtered history as CSV. */
+export function historyCsvUrl(filters: HistoryFilters) {
+  const params = historyParams(filters).toString()
+  return params ? `/api/tickets.csv?${params}` : "/api/tickets.csv"
+}
+
+/**
+ * Daily settled totals ending today, days breaking at the viewer's midnight.
+ * `days` omitted = since the first settlement. Empty until anything settled.
+ */
+export function fetchCirculation(days?: number) {
+  const params = new URLSearchParams({ utc_offset: String(-new Date().getTimezoneOffset()) })
+  if (days) params.set("days", String(days))
+  return requestJson<CirculationDay[]>(`/api/circulation?${params}`)
 }
 
 // ---- attachment setup & self-test ----

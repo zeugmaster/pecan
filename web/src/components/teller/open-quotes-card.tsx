@@ -1,6 +1,16 @@
-import type { OpenQuoteSummary } from "@/lib/api"
+import { useState } from "react"
+
+import type { OpenQuoteSummary, TicketKind } from "@/lib/api"
 import { formatAge, formatAmount, formatExpiry } from "@/lib/format"
-import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import {
   Table,
   TableBody,
@@ -10,7 +20,16 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { StatusBadge } from "@/components/shared/badges"
-import { EmptyState, MonoChip } from "@/components/shared/bits"
+import { EmptyState, MonoChip, SegmentedControl } from "@/components/shared/bits"
+
+/** Rows shown before "Show all": the list stays scannable on a busy day. */
+const COLLAPSED_ROWS = 10
+
+const KINDS = [
+  { value: "all", label: "All" },
+  { value: "incoming", label: "Deposits" },
+  { value: "outgoing", label: "Payouts" },
+] as const
 
 /**
  * Read-only situational awareness: which wallet-created quotes are open right
@@ -25,19 +44,36 @@ export function OpenQuotesCard({
   quotes: OpenQuoteSummary[]
   now: number
 }) {
+  const [kind, setKind] = useState<TicketKind | "all">("all")
+  const [expanded, setExpanded] = useState(false)
+  const filtered = kind === "all" ? quotes : quotes.filter((quote) => quote.kind === kind)
+  const visible = expanded ? filtered : filtered.slice(0, COLLAPSED_ROWS)
+
   return (
     <Card>
       <CardHeader>
         <CardTitle>Open quotes</CardTitle>
-        <CardAction>
-          <span className="text-sm text-muted-foreground">{quotes.length} open</span>
-        </CardAction>
+        <CardDescription>
+          {quotes.length === 0
+            ? "None right now"
+            : `${quotes.length} open · newest first`}
+        </CardDescription>
+        {quotes.length > 0 && (
+          <CardAction>
+            <SegmentedControl label="Show" value={kind} onChange={setKind} options={KINDS} />
+          </CardAction>
+        )}
       </CardHeader>
       <CardContent className="px-0">
         {quotes.length === 0 ? (
           <EmptyState
             title="No open quotes"
             body="Customers create quotes in their wallet; they appear here."
+          />
+        ) : filtered.length === 0 ? (
+          <EmptyState
+            title={kind === "incoming" ? "No open deposits" : "No open payouts"}
+            body="Switch to All to see every open quote."
           />
         ) : (
           <Table className="min-w-[560px]">
@@ -52,7 +88,7 @@ export function OpenQuotesCard({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {quotes.map((quote, index) => (
+              {visible.map((quote, index) => (
                 <TableRow key={`${quote.prefix}-${index}`}>
                   <TableCell className="pl-6">
                     <MonoChip>{quote.prefix}…</MonoChip>
@@ -76,6 +112,13 @@ export function OpenQuotesCard({
               ))}
             </TableBody>
           </Table>
+        )}
+        {filtered.length > COLLAPSED_ROWS && (
+          <div className="px-6 pt-2">
+            <Button variant="ghost" size="sm" className="w-full" onClick={() => setExpanded(!expanded)}>
+              {expanded ? "Show fewer" : `Show all ${filtered.length}`}
+            </Button>
+          </div>
         )}
       </CardContent>
     </Card>

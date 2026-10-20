@@ -20,8 +20,10 @@ mod backend;
 mod checks;
 mod clients;
 mod config;
+mod keysets;
 mod sessions;
 mod state;
+mod timefmt;
 mod users;
 mod web;
 
@@ -44,6 +46,7 @@ use crate::backend::BranchBackend;
 use crate::checks::SelfTestOutcome;
 use crate::clients::MintHttpClient;
 use crate::config::{AppConfig, ConfigStore, LoadedConfig, LEGACY_BACKUP_FILENAME};
+use crate::keysets::KeysetLog;
 use crate::sessions::SessionStore;
 use crate::state::BranchState;
 use crate::users::UserStore;
@@ -155,6 +158,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "dev".to_string());
 
     let state_path = work_dir.join("tickets.json");
+    let keyset_log_path = work_dir.join("keysets.json");
 
     // Load the config, bootstrap a fresh one, or migrate a v3 managed-stack
     // file. Ordering matters for crash safety: the operator password from a
@@ -230,6 +234,7 @@ async fn main() -> Result<()> {
     }
     let sessions = SessionStore::load(sessions_path).await?;
     let branch = BranchState::load(state_path).await?;
+    let keyset_log = KeysetLog::load(keyset_log_path).await?;
 
     let unit: Option<CurrencyUnit> = if app_config.unit.is_empty() {
         None
@@ -269,6 +274,7 @@ async fn main() -> Result<()> {
     let self_test_running = Arc::new(AtomicBool::new(false));
 
     spawn_ticket_sweeper(branch.clone());
+    spawn_keyset_observer(config.clone(), keyset_log.clone(), branch.clone());
     spawn_self_test_on_first_attach(
         config.clone(),
         config_store.clone(),
@@ -291,6 +297,7 @@ async fn main() -> Result<()> {
         published_grpc_port,
         self_test,
         self_test_running,
+        keyset_log,
     ));
 
     tracing::info!("branch-processor HTTP on {http_socket}");
@@ -321,6 +328,32 @@ fn spawn_ticket_sweeper(branch: BranchState) {
             if removed > 0 {
                 tracing::info!("swept {removed} expired unfunded quote(s)");
             }
+        }
+    });
+}
+
+/// Read the mint's keyset list periodically so the console's key timeline
+/// knows when keysets appear and stop issuing, even while nobody has the
+/// console open. Rotations are rare; a few minutes of resolution is plenty.
+fn spawn_keyset_observer(
+    config: Arc<RwLock<AppConfig>>,
+    keyset_log: KeysetLog,
+    branch: BranchState,
+) {
+    tokio::spawn(async move {
+        loop {
+            let mint_url = config.read().await.mint_url.clone();
+            if !mint_url.is_empty() {
+                match MintHttpClient::new(mint_url).list_keysets().await {
+                    Ok(keysets) => {
+                        if keyset_log.observe(&keysets, unix_now()).await {
+                            branch.notify_ui_change();
+                        }
+                    }
+                    Err(e) => tracing::debug!("keyset observation skipped: {e:#}"),
+                }
+            }
+            sleep(Duration::from_secs(300)).await;
         }
     });
 }

@@ -77,7 +77,8 @@ export function AppShell({ children }: { children: ReactNode }) {
                 }}
               >
                 <Badge variant="outline">
-                  {openQuotes} open quote{openQuotes === 1 ? "" : "s"}
+                  {openQuotes} open
+                  <span className="max-sm:hidden">quote{openQuotes === 1 ? "" : "s"}</span>
                 </Badge>
               </a>
             )}
@@ -96,13 +97,13 @@ export function AppShell({ children }: { children: ReactNode }) {
             </Tooltip>
             <Button variant="ghost" size="sm" onClick={() => void signOut()}>
               <LogOut />
-              Sign out
+              <span className="max-sm:sr-only">Sign out</span>
             </Button>
           </div>
         </div>
       </header>
 
-      <main className="mx-auto grid w-full max-w-6xl gap-6 px-4 py-6">{children}</main>
+      <main className="mx-auto grid w-full max-w-6xl gap-6 px-4 py-6 [&>*]:min-w-0">{children}</main>
     </div>
   )
 }
