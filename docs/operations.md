@@ -153,7 +153,7 @@ Docker Compose uses named volumes:
 | Volume | Data |
 |---|---|
 | `config-data` | processor config (`setup.json`), user accounts (`users.json`) |
-| `processor-data` | branch ticket store (`tickets.json`), login sessions |
+| `processor-data` | branch ticket store (`tickets.json`), when the mint's keysets were first seen and stopped issuing (`keysets.json`), login sessions |
 | `caddy-data`, `caddy-config` | TLS certificates and Caddy state (TLS mode only) |
 | `mintd-data` | the bundled mint's database and work dir (bundled installs only) |
 

@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
-import { ApiRequestError, matchQuote, type Ticket } from "@/lib/api"
+import { ApiRequestError, matchQuote, type CirculationDay, type Ticket } from "@/lib/api"
+import { formatAmount } from "@/lib/format"
+import { navigate } from "@/lib/router"
 import { useSnapshot } from "@/lib/snapshot"
+import { settledKey, useCirculation } from "@/lib/use-circulation"
 import { useNow } from "@/lib/use-now"
+import { buttonVariants } from "@/components/ui/button"
 import { ActivityTable } from "@/components/shared/activity-table"
 import { MatchCard } from "@/components/teller/match-card"
 import { MatchedQuoteCard } from "@/components/teller/matched-quote-card"
@@ -19,6 +23,8 @@ export function TellerPage() {
   const now = useNow(snapshot.now)
   const [matched, setMatched] = useState<Ticket | null>(null)
   const matchedCode = useRef<string | null>(null)
+  const today = useCirculation(1, settledKey(snapshot)).data?.[0]
+  const unit = snapshot.setup.unit
 
   function showMatch(ticket: Ticket, code: string) {
     matchedCode.current = code
@@ -76,10 +82,32 @@ export function TellerPage() {
 
       <ActivityTable
         title="Recent activity"
-        tickets={snapshot.recent_done}
-        now={snapshot.now}
+        description={today && unit ? todaySummary(today, unit) : undefined}
+        tickets={snapshot.recent_done.slice(0, 10)}
+        now={now}
         showNotes
+        action={
+          <a
+            href="/#activity"
+            className={buttonVariants({ variant: "outline", size: "sm" })}
+            onClick={(event) => {
+              event.preventDefault()
+              navigate("/#activity")
+            }}
+          >
+            Full history
+          </a>
+        }
       />
     </div>
   )
+}
+
+/** "Today: 3 deposits (1,200 ORA in) · 1 payout (200 ORA out)" — for squaring the drawer. */
+function todaySummary(today: CirculationDay, unit: string) {
+  const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`
+  return `Today: ${plural(today.deposit_count, "deposit")} (${formatAmount(today.deposits, unit)} in) · ${plural(
+    today.payout_count,
+    "payout",
+  )} (${formatAmount(today.payouts, unit)} out)`
 }

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Json, Path as AxumPath, State};
+use axum::extract::{Json, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -31,10 +31,12 @@ use crate::backend::BranchBackend;
 use crate::checks::{self, Check, MintIdentity, SelfTestOutcome};
 use crate::clients::{KeysetEntry, MintHttpClient};
 use crate::config::{render_mint_snippet, AppConfig, ConfigStore, PASSWORD_MIN_LENGTH};
+use crate::keysets::KeysetLog;
 use crate::sessions::SessionStore;
 use crate::state::{
     normalize_match_input, BranchState, MatchResult, Ticket, TicketKind, TicketStatus,
 };
+use crate::timefmt::{iso_date, iso_datetime};
 use crate::users::{PublicUser, UserError, UserStore};
 
 #[derive(Clone)]
@@ -57,6 +59,8 @@ pub struct WebState {
     pub published_grpc_port: u16,
     pub self_test: Arc<RwLock<Option<SelfTestOutcome>>>,
     pub self_test_running: Arc<AtomicBool>,
+    /// When the mint's keysets were first seen and seen to stop issuing.
+    pub keyset_log: KeysetLog,
 }
 
 impl WebState {
@@ -74,6 +78,7 @@ impl WebState {
         published_grpc_port: u16,
         self_test: Arc<RwLock<Option<SelfTestOutcome>>>,
         self_test_running: Arc<AtomicBool>,
+        keyset_log: KeysetLog,
     ) -> Self {
         Self {
             branch,
@@ -88,6 +93,7 @@ impl WebState {
             published_grpc_port,
             self_test,
             self_test_running,
+            keyset_log,
         }
     }
 }
@@ -104,6 +110,9 @@ pub fn router(state: WebState) -> Router {
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
         .route("/api/quotes/match", post(api_match_quote))
+        .route("/api/tickets", get(api_tickets))
+        .route("/api/tickets.csv", get(api_tickets_csv))
+        .route("/api/circulation", get(api_circulation))
         .route("/api/tickets/{id}/mark-paid", post(api_mark_paid))
         .route("/api/tickets/{id}/mark-failed", post(api_mark_failed))
         .route("/api/settings/attachment", post(api_set_attachment))
@@ -352,10 +361,9 @@ struct ApiAppSnapshot {
     /// Read-only identity of the attached mint, from its /v1/info.
     mint_identity: Option<MintIdentity>,
     /// The configured unit's keysets at the mint (read-only).
-    keysets: Vec<KeysetEntry>,
+    keysets: Vec<ApiKeyset>,
     keysets_error: Option<String>,
     summary: MintSummary,
-    circulation: Vec<CirculationPoint>,
     open_quotes: Vec<ApiOpenQuote>,
     recent_done: Vec<ApiTicket>,
     /// One-time migration notice: this install previously managed its mint.
@@ -413,6 +421,11 @@ struct ApiTicket {
     created_at: u64,
     paid_at: Option<u64>,
     expires_at: Option<u64>,
+    voided_at: Option<u64>,
+    /// Settled or voided: when the ticket left the open list.
+    closed_at: u64,
+    /// The console user who settled or voided it.
+    operator: Option<String>,
     description: Option<String>,
     notes: Option<String>,
 }
@@ -454,14 +467,17 @@ impl ApiOpenQuote {
     }
 }
 
+/// A keyset of the configured unit as the mint lists it, plus what this
+/// processor observed of its lifetime (see keysets.rs).
 #[derive(Serialize)]
-struct CirculationPoint {
-    ts: u64,
-    ticket_id: String,
-    kind: TicketKind,
-    amount: u64,
-    delta: i128,
-    circulation: i128,
+struct ApiKeyset {
+    #[serde(flatten)]
+    keyset: KeysetEntry,
+    first_seen_at: Option<u64>,
+    /// False when the keyset predates this processor's first look at the
+    /// mint: it started issuing some time before `first_seen_at`.
+    start_observed: bool,
+    deactivated_at: Option<u64>,
 }
 
 fn mint_client_for(config: &AppConfig) -> Option<MintHttpClient> {
@@ -499,9 +515,10 @@ async fn api_app(State(state): State<WebState>, headers: HeaderMap) -> Response 
         .filter(|t| t.status.is_active())
         .map(ApiOpenQuote::from_ticket)
         .collect();
-    let recent_done = tickets
-        .iter()
-        .filter(|t| !t.status.is_active())
+    let mut done: Vec<&Ticket> = tickets.iter().filter(|t| !t.status.is_active()).collect();
+    sort_newest_closed_first(&mut done);
+    let recent_done = done
+        .into_iter()
         .take(50)
         .map(ApiTicket::from_ticket)
         .collect();
@@ -519,6 +536,7 @@ async fn api_app(State(state): State<WebState>, headers: HeaderMap) -> Response 
 
     let self_test = state.self_test.read().await.clone();
     let checklist = checks::evaluate(&checks::ChecklistInputs {
+        now,
         unit: &config.unit,
         method: &config.method,
         mint_url: &config.mint_url,
@@ -532,11 +550,24 @@ async fn api_app(State(state): State<WebState>, headers: HeaderMap) -> Response 
         Some(Ok(info)) => Some(checks::mint_identity(info)),
         _ => None,
     };
+    if let Some(Ok(items)) = &keysets_result {
+        state.keyset_log.observe(items, now).await;
+    }
+    let sightings = state.keyset_log.sightings().await;
     let (keysets, keysets_error) = match keysets_result {
         Some(Ok(items)) => (
             items
                 .into_iter()
                 .filter(|keyset| keyset.unit == config.unit)
+                .map(|keyset| {
+                    let sighting = sightings.get(&keyset.id);
+                    ApiKeyset {
+                        first_seen_at: sighting.map(|s| s.first_seen_at),
+                        start_observed: sighting.is_some_and(|s| s.start_observed),
+                        deactivated_at: sighting.and_then(|s| s.deactivated_at),
+                        keyset,
+                    }
+                })
                 .collect(),
             None,
         ),
@@ -578,7 +609,6 @@ async fn api_app(State(state): State<WebState>, headers: HeaderMap) -> Response 
         keysets,
         keysets_error,
         summary,
-        circulation: circulation_points(&unit_tickets),
         open_quotes,
         recent_done,
         migrated_from_managed: config.migrated_from_managed,
@@ -601,41 +631,325 @@ impl ApiTicket {
             created_at: ticket.created_at,
             paid_at: ticket.paid_at,
             expires_at: ticket.expires_at,
+            voided_at: ticket.voided_at,
+            closed_at: ticket.closed_at(),
+            operator: ticket.operator.clone(),
             description: ticket.description.clone(),
             notes: ticket.notes.clone(),
         }
     }
 }
 
-fn circulation_points(tickets: &[Ticket]) -> Vec<CirculationPoint> {
-    let mut paid: Vec<_> = tickets
+/// Settled history order: most recently settled or voided first.
+fn sort_newest_closed_first(tickets: &mut [&Ticket]) {
+    tickets.sort_by(|a, b| {
+        b.closed_at()
+            .cmp(&a.closed_at())
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+// ---------------- settled history ----------------
+
+const HISTORY_DEFAULT_LIMIT: usize = 25;
+const HISTORY_MAX_LIMIT: usize = 200;
+
+/// Filters for the settled-activity history (`/api/tickets` and its CSV).
+/// Only closed tickets are ever listed: open quote ids stay off the screen.
+#[derive(Deserialize, Default)]
+struct HistoryQuery {
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+    kind: Option<TicketKind>,
+    status: Option<TicketStatus>,
+    /// Ticket or quote id fragment, note text, or operator.
+    #[serde(default)]
+    q: String,
+    /// Closed at or after (unix seconds).
+    from: Option<u64>,
+    /// Closed before (unix seconds).
+    to: Option<u64>,
+}
+
+impl HistoryQuery {
+    fn matches(&self, ticket: &Ticket) -> bool {
+        if ticket.status.is_active() || checks::is_self_test_ticket(ticket) {
+            return false;
+        }
+        if self.kind.is_some_and(|kind| kind != ticket.kind)
+            || self.status.is_some_and(|status| status != ticket.status)
+        {
+            return false;
+        }
+        let closed = ticket.closed_at();
+        if self.from.is_some_and(|from| closed < from) || self.to.is_some_and(|to| closed >= to) {
+            return false;
+        }
+        let needle = self.q.trim().to_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+        let hex_needle: String = needle.chars().filter(|c| *c != '-').collect();
+        let contains = |text: Option<&str>| {
+            text.is_some_and(|text| text.to_lowercase().contains(needle.as_str()))
+        };
+        contains(Some(&ticket.id))
+            || contains(ticket.notes.as_deref())
+            || contains(ticket.operator.as_deref())
+            || (!hex_needle.is_empty()
+                && ticket.quote_id.as_deref().is_some_and(|quote_id| {
+                    quote_id
+                        .to_lowercase()
+                        .replace('-', "")
+                        .contains(hex_needle.as_str())
+                }))
+    }
+}
+
+async fn settled_history(state: &WebState, query: &HistoryQuery) -> Vec<Ticket> {
+    let tickets = state.branch.list_all().await;
+    let mut matched: Vec<&Ticket> = tickets.iter().filter(|t| query.matches(t)).collect();
+    sort_newest_closed_first(&mut matched);
+    matched.into_iter().cloned().collect()
+}
+
+#[derive(Serialize)]
+struct ApiHistoryPage {
+    tickets: Vec<ApiTicket>,
+    /// Rows matching the filters, across all pages.
+    total: usize,
+    offset: usize,
+    limit: usize,
+    /// Paid totals for the configured unit over every matching row.
+    summary: MintSummary,
+}
+
+async fn api_tickets(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    if let Err(r) = require_api_auth(&state, &headers).await {
+        return r;
+    }
+    let unit = state.config.read().await.unit.clone();
+    let matched = settled_history(&state, &query).await;
+    let limit = query
+        .limit
+        .unwrap_or(HISTORY_DEFAULT_LIMIT)
+        .clamp(1, HISTORY_MAX_LIMIT);
+    let unit_rows: Vec<Ticket> = matched.iter().filter(|t| t.unit == unit).cloned().collect();
+    Json(ApiHistoryPage {
+        tickets: matched
+            .iter()
+            .skip(query.offset)
+            .take(limit)
+            .map(ApiTicket::from_ticket)
+            .collect(),
+        total: matched.len(),
+        offset: query.offset,
+        limit,
+        summary: MintSummary::from_tickets(&unit_rows),
+    })
+    .into_response()
+}
+
+/// The same filtered history as a spreadsheet-ready CSV (UTC timestamps).
+async fn api_tickets_csv(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    if let Err(r) = require_api_auth(&state, &headers).await {
+        return r;
+    }
+    let unit = state.config.read().await.unit.clone();
+    let rows = settled_history(&state, &query).await;
+    let filename = if unit.is_empty() {
+        format!("pecan-activity-{}.csv", iso_date(unix_now()))
+    } else {
+        format!("pecan-activity-{unit}-{}.csv", iso_date(unix_now()))
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        history_csv(&rows),
+    )
+        .into_response()
+}
+
+fn history_csv(rows: &[Ticket]) -> String {
+    let mut out = String::from(
+        "ticket,quote_id,kind,amount,unit,status,created_at,closed_at,operator,notes\n",
+    );
+    for ticket in rows {
+        let fields = [
+            ticket.id.clone(),
+            ticket.quote_id.clone().unwrap_or_default(),
+            match ticket.kind {
+                TicketKind::Incoming => "deposit",
+                TicketKind::Outgoing => "payout",
+            }
+            .to_string(),
+            ticket.amount.to_string(),
+            ticket.unit.clone(),
+            match ticket.status {
+                TicketStatus::Paid => "paid",
+                _ => "failed",
+            }
+            .to_string(),
+            iso_datetime(ticket.created_at),
+            iso_datetime(ticket.closed_at()),
+            ticket.operator.clone().unwrap_or_default(),
+            ticket.notes.clone().unwrap_or_default(),
+        ];
+        let line: Vec<String> = fields.iter().map(|field| csv_field(field)).collect();
+        out.push_str(&line.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// Quote a CSV field when needed, and defuse spreadsheet formulas in free
+/// text (operator notes) by prefixing an apostrophe.
+fn csv_field(raw: &str) -> String {
+    let defused = if raw.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{raw}")
+    } else {
+        raw.to_string()
+    };
+    if defused.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", defused.replace('"', "\"\""))
+    } else {
+        defused
+    }
+}
+
+// ---------------- circulation ----------------
+
+/// Upper bound on returned days (ten years), whatever the range asked for.
+const CIRCULATION_MAX_DAYS: i64 = 3_660;
+
+#[derive(Deserialize)]
+struct CirculationQuery {
+    /// Trailing days to return, today included; omitted = since the first
+    /// settlement.
+    days: Option<u32>,
+    /// The viewer's offset from UTC in minutes (east positive), so days break
+    /// at the viewer's midnight.
+    #[serde(default)]
+    utc_offset: i32,
+}
+
+/// One calendar day of settled activity for the configured unit.
+#[derive(Debug, Serialize)]
+struct CirculationDay {
+    /// Unix seconds of the day's (viewer-local) midnight.
+    start: i64,
+    deposits: u64,
+    deposit_count: usize,
+    payouts: u64,
+    payout_count: usize,
+    /// Net settled (deposits minus payouts since the beginning) at day end.
+    circulation: i128,
+}
+
+async fn api_circulation(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<CirculationQuery>,
+) -> Response {
+    if let Err(r) = require_api_auth(&state, &headers).await {
+        return r;
+    }
+    let unit = state.config.read().await.unit.clone();
+    let tickets: Vec<Ticket> = state
+        .branch
+        .list_all()
+        .await
+        .into_iter()
+        .filter(|ticket| ticket.unit == unit)
+        .collect();
+    let utc_offset_secs = i64::from(query.utc_offset.clamp(-840, 840)) * 60;
+    Json(circulation_days(
+        &tickets,
+        query.days,
+        utc_offset_secs,
+        unix_now(),
+    ))
+    .into_response()
+}
+
+/// Daily buckets from the range start through today, every day present (so
+/// charts space time evenly), with the running total carried in from before
+/// the range. Empty until the first settlement.
+fn circulation_days(
+    tickets: &[Ticket],
+    days: Option<u32>,
+    utc_offset_secs: i64,
+    now: u64,
+) -> Vec<CirculationDay> {
+    let day_of = |ts: u64| (ts as i64 + utc_offset_secs).div_euclid(86_400);
+    let paid: Vec<&Ticket> = tickets
         .iter()
         .filter(|ticket| ticket.status == TicketStatus::Paid)
         .collect();
-    paid.sort_by(|a, b| {
-        let a_ts = a.paid_at.unwrap_or(a.created_at);
-        let b_ts = b.paid_at.unwrap_or(b.created_at);
-        a_ts.cmp(&b_ts)
-    });
+    let Some(first_paid) = paid.iter().map(|ticket| day_of(ticket.closed_at())).min() else {
+        return Vec::new();
+    };
+    let today = day_of(now);
+    let first = match days {
+        Some(days) if days > 0 => today - i64::from(days) + 1,
+        _ => first_paid,
+    }
+    .clamp(today - CIRCULATION_MAX_DAYS + 1, today);
 
-    let mut circulation = 0i128;
-    paid.into_iter()
-        .map(|ticket| {
-            let delta = match ticket.kind {
+    let mut out: Vec<CirculationDay> = (first..=today)
+        .map(|day| CirculationDay {
+            start: day * 86_400 - utc_offset_secs,
+            deposits: 0,
+            deposit_count: 0,
+            payouts: 0,
+            payout_count: 0,
+            circulation: 0,
+        })
+        .collect();
+    let mut carried = 0i128;
+    for ticket in paid {
+        // A settlement stamped after `now` (clock skew) counts as today.
+        let day = day_of(ticket.closed_at()).min(today);
+        if day < first {
+            carried += match ticket.kind {
                 TicketKind::Incoming => ticket.amount as i128,
                 TicketKind::Outgoing => -(ticket.amount as i128),
             };
-            circulation += delta;
-            CirculationPoint {
-                ts: ticket.paid_at.unwrap_or(ticket.created_at),
-                ticket_id: ticket.id.clone(),
-                kind: ticket.kind,
-                amount: ticket.amount,
-                delta,
-                circulation,
+            continue;
+        }
+        let bucket = &mut out[(day - first) as usize];
+        match ticket.kind {
+            TicketKind::Incoming => {
+                bucket.deposits = bucket.deposits.saturating_add(ticket.amount);
+                bucket.deposit_count += 1;
             }
-        })
-        .collect()
+            TicketKind::Outgoing => {
+                bucket.payouts = bucket.payouts.saturating_add(ticket.amount);
+                bucket.payout_count += 1;
+            }
+        }
+    }
+    let mut running = carried;
+    for bucket in &mut out {
+        running += bucket.deposits as i128 - bucket.payouts as i128;
+        bucket.circulation = running;
+    }
+    out
 }
 
 async fn api_login(
@@ -827,10 +1141,11 @@ async fn api_mark_paid(
     AxumPath(id): AxumPath<String>,
     Json(form): Json<NotesForm>,
 ) -> Response {
-    if let Err(r) = require_api_auth(&state, &headers).await {
-        return r;
-    }
-    match mark_paid_inner(&state, &id, form.notes).await {
+    let authed = match require_api_auth(&state, &headers).await {
+        Ok(authed) => authed,
+        Err(r) => return r,
+    };
+    match mark_paid_inner(&state, &id, form.notes, authed.username).await {
         Ok(ticket) => Json(ApiTicket::from_ticket(&ticket)).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e),
     }
@@ -842,10 +1157,11 @@ async fn api_mark_failed(
     AxumPath(id): AxumPath<String>,
     Json(form): Json<NotesForm>,
 ) -> Response {
-    if let Err(r) = require_api_auth(&state, &headers).await {
-        return r;
-    }
-    match mark_failed_inner(&state, &id, form.notes).await {
+    let authed = match require_api_auth(&state, &headers).await {
+        Ok(authed) => authed,
+        Err(r) => return r,
+    };
+    match mark_failed_inner(&state, &id, form.notes, authed.username).await {
         Ok(ticket) => Json(ApiTicket::from_ticket(&ticket)).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e),
     }
@@ -1264,18 +1580,28 @@ fn clean_notes(notes: String) -> Option<String> {
     }
 }
 
-async fn mark_paid_inner(state: &WebState, id: &str, notes: String) -> Result<Ticket, String> {
+async fn mark_paid_inner(
+    state: &WebState,
+    id: &str,
+    notes: String,
+    operator: String,
+) -> Result<Ticket, String> {
     state
         .branch
-        .mark_paid(id, clean_notes(notes))
+        .mark_paid(id, clean_notes(notes), Some(operator))
         .await
         .map_err(|e| format!("mark_paid: {e}"))
 }
 
-async fn mark_failed_inner(state: &WebState, id: &str, notes: String) -> Result<Ticket, String> {
+async fn mark_failed_inner(
+    state: &WebState,
+    id: &str,
+    notes: String,
+    operator: String,
+) -> Result<Ticket, String> {
     state
         .branch
-        .mark_failed(id, clean_notes(notes))
+        .mark_failed(id, clean_notes(notes), Some(operator))
         .await
         .map_err(|e| format!("mark_failed: {e}"))
 }
@@ -1325,6 +1651,165 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", value.parse().unwrap());
         headers
+    }
+
+    fn closed(
+        quote_id: &str,
+        kind: TicketKind,
+        amount: u64,
+        status: TicketStatus,
+        at: u64,
+    ) -> Ticket {
+        let mut ticket = match kind {
+            TicketKind::Incoming => {
+                Ticket::new_incoming(quote_id.into(), amount, "ora".into(), None, None)
+            }
+            TicketKind::Outgoing => {
+                Ticket::new_outgoing(quote_id.into(), amount, "ora".into(), None, None)
+            }
+        };
+        ticket.status = status;
+        match status {
+            TicketStatus::Paid => ticket.paid_at = Some(at),
+            _ => ticket.voided_at = Some(at),
+        }
+        ticket
+    }
+
+    #[test]
+    fn history_filters_closed_tickets_only() {
+        let mut paid = closed(
+            "0198c0ef-3f11-7abc-9def-aaaaaa9ec0f4",
+            TicketKind::Incoming,
+            500,
+            TicketStatus::Paid,
+            1_000,
+        );
+        paid.operator = Some("teller".into());
+        let mut voided = closed(
+            "0198c0ef-3f11-7abc-9def-bbbbbb111111",
+            TicketKind::Outgoing,
+            70,
+            TicketStatus::Failed,
+            2_000,
+        );
+        voided.notes = Some("Customer left".into());
+        let open = Ticket::new_incoming(
+            "0198c0ef-3f11-7abc-9def-cccccc222222".into(),
+            9,
+            "ora".into(),
+            None,
+            None,
+        );
+
+        let all = HistoryQuery::default();
+        assert!(all.matches(&paid) && all.matches(&voided));
+        assert!(
+            !all.matches(&open),
+            "open quotes never appear in the history"
+        );
+
+        let by_tail = HistoryQuery {
+            q: "9EC0F4".into(),
+            ..Default::default()
+        };
+        assert!(by_tail.matches(&paid) && !by_tail.matches(&voided));
+        let by_hyphenated = HistoryQuery {
+            q: "9def-aaaaaa".into(),
+            ..Default::default()
+        };
+        assert!(by_hyphenated.matches(&paid));
+        let by_note = HistoryQuery {
+            q: "customer".into(),
+            ..Default::default()
+        };
+        assert!(by_note.matches(&voided) && !by_note.matches(&paid));
+        let by_operator = HistoryQuery {
+            q: "teller".into(),
+            ..Default::default()
+        };
+        assert!(by_operator.matches(&paid) && !by_operator.matches(&voided));
+
+        let payouts = HistoryQuery {
+            kind: Some(TicketKind::Outgoing),
+            ..Default::default()
+        };
+        assert!(payouts.matches(&voided) && !payouts.matches(&paid));
+        let window = HistoryQuery {
+            from: Some(1_000),
+            to: Some(2_000),
+            ..Default::default()
+        };
+        assert!(window.matches(&paid) && !window.matches(&voided));
+
+        let mut rows = vec![&paid, &voided];
+        sort_newest_closed_first(&mut rows);
+        assert_eq!(rows[0].id, voided.id);
+    }
+
+    #[test]
+    fn csv_fields_are_quoted_and_defused() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("=HYPERLINK(1)"), "'=HYPERLINK(1)");
+        assert_eq!(csv_field("-5, cash"), "\"'-5, cash\"");
+    }
+
+    #[test]
+    fn circulation_days_fill_gaps_and_carry_totals() {
+        const DAY: u64 = 86_400;
+        let now = 10 * DAY + 3_600;
+        let tickets = vec![
+            closed(
+                "0198c0ef-3f11-7abc-9def-aaaaaa000001",
+                TicketKind::Incoming,
+                100,
+                TicketStatus::Paid,
+                2 * DAY,
+            ),
+            closed(
+                "0198c0ef-3f11-7abc-9def-aaaaaa000002",
+                TicketKind::Incoming,
+                50,
+                TicketStatus::Paid,
+                8 * DAY + 10,
+            ),
+            closed(
+                "0198c0ef-3f11-7abc-9def-aaaaaa000003",
+                TicketKind::Outgoing,
+                30,
+                TicketStatus::Paid,
+                10 * DAY,
+            ),
+            closed(
+                "0198c0ef-3f11-7abc-9def-aaaaaa000004",
+                TicketKind::Incoming,
+                999,
+                TicketStatus::Failed,
+                9 * DAY,
+            ),
+        ];
+
+        let all = circulation_days(&tickets, None, 0, now);
+        assert_eq!(all.len(), 9, "day 2 through day 10, gaps included");
+        assert_eq!(all[0].circulation, 100);
+        assert_eq!(all.last().unwrap().circulation, 120);
+
+        let recent = circulation_days(&tickets, Some(3), 0, now);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].start, 8 * DAY as i64);
+        assert_eq!((recent[0].deposits, recent[0].deposit_count), (50, 1));
+        assert_eq!(recent[0].circulation, 150, "day 2 carried in");
+        assert_eq!((recent[2].payouts, recent[2].payout_count), (30, 1));
+
+        // Two hours west of UTC it is still day 9, and the payout at day 10
+        // 00:00 UTC happened on (local) day 9 too.
+        let west = circulation_days(&tickets, Some(3), -7_200, now);
+        assert_eq!(west[2].start, 9 * DAY as i64 + 7_200);
+        assert_eq!(west[2].payouts, 30);
+
+        assert!(circulation_days(&[], Some(7), 0, now).is_empty());
     }
 
     #[test]

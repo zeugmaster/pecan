@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::clients::{KeysetEntry, MintHttpClient};
 use crate::config::{compatible_mintd_image, COMPATIBLE_CDK_VERSION};
 use crate::state::{BranchState, Ticket};
+use crate::timefmt::iso_date;
 
 /// Notes marker on tickets created (and immediately voided) by the
 /// self-test; the web layer filters them out of every operator-facing list.
@@ -30,6 +31,9 @@ const MIN_COMFORTABLE_MINT_TTL_SECS: u64 = 900;
 /// Warn when the melt-quote lifetime is shorter than this (cdk's default of
 /// 60 s trips wallets that show a confirmation screen).
 const MIN_COMFORTABLE_MELT_TTL_SECS: u64 = 300;
+/// Warn when the active keyset's ecash stops being redeemable within this
+/// window: the mint operator needs time to rotate, wallets time to move.
+pub const KEYSET_EXPIRY_WARNING_SECS: u64 = 30 * 86_400;
 
 pub fn is_self_test_ticket(ticket: &Ticket) -> bool {
     ticket.notes.as_deref() == Some(SELF_TEST_NOTE)
@@ -56,6 +60,7 @@ pub struct Check {
 }
 
 pub struct ChecklistInputs<'a> {
+    pub now: u64,
     pub unit: &'a str,
     pub method: &'a str,
     pub mint_url: &'a str,
@@ -333,21 +338,7 @@ fn check_keyset(inputs: &ChecklistInputs) -> Check {
                 .filter(|keyset| keyset.unit == inputs.unit)
                 .collect();
             if let Some(active) = of_unit.iter().find(|keyset| keyset.active) {
-                Check {
-                    id,
-                    status: CheckStatus::Ok,
-                    title,
-                    detail: format!(
-                        "Active keyset {} (fee {} ppk{}).",
-                        active.id,
-                        active.input_fee_ppk,
-                        match active.final_expiry {
-                            Some(_) => ", expiring",
-                            None => ", no expiry",
-                        }
-                    ),
-                    remedy: None,
-                }
+                active_keyset_check(active, inputs.now)
             } else if !of_unit.is_empty() {
                 Check {
                     id,
@@ -397,6 +388,61 @@ fn check_keyset(inputs: &ChecklistInputs) -> Check {
     }
 }
 
+/// The active keyset's state, expiry included: an expired active keyset
+/// blocks issuance (cdk refuses to sign with it) and mintd does not replace
+/// it on restart, so it fails; an imminent expiry warns.
+fn active_keyset_check(active: &KeysetEntry, now: u64) -> Check {
+    let id = "keyset";
+    let title = "Unit has active keys";
+    let rotate = "Rotate to a fresh keyset with the mint's own tooling (cdk-mint-cli \
+                  rotate-next-keyset) — the Keys tab has the exact command.";
+    match active.final_expiry {
+        // cdk treats a keyset as expired strictly after its final expiry.
+        Some(expiry) if expiry < now => Check {
+            id,
+            status: CheckStatus::Fail,
+            title,
+            detail: format!(
+                "The active keyset {} expired on {} — the mint can no longer issue \
+                 ecash for this unit, so deposits cannot complete.",
+                active.id,
+                iso_date(expiry)
+            ),
+            remedy: Some(format!(
+                "{rotate} Restarting the mint does not replace an expired keyset."
+            )),
+        },
+        Some(expiry) if expiry - now < KEYSET_EXPIRY_WARNING_SECS => Check {
+            id,
+            status: CheckStatus::Warn,
+            title,
+            detail: format!(
+                "The active keyset {} expires on {} ({} days) — ecash still on it then \
+                 can no longer be redeemed.",
+                active.id,
+                iso_date(expiry),
+                (expiry - now) / 86_400
+            ),
+            remedy: Some(rotate.to_string()),
+        },
+        expiry => Check {
+            id,
+            status: CheckStatus::Ok,
+            title,
+            detail: format!(
+                "Active keyset {} (fee {} ppk, {}).",
+                active.id,
+                active.input_fee_ppk,
+                match expiry {
+                    Some(expiry) => format!("expires {}", iso_date(expiry)),
+                    None => "no expiry".to_string(),
+                }
+            ),
+            remedy: None,
+        },
+    }
+}
+
 fn check_end_to_end(inputs: &ChecklistInputs) -> Check {
     let id = "end_to_end";
     let title = "End-to-end test";
@@ -405,8 +451,8 @@ fn check_end_to_end(inputs: &ChecklistInputs) -> Check {
             id,
             status: CheckStatus::Unknown,
             title,
-            detail: "Not run yet. It runs automatically once the mint links up, or run it \
-                     from the card below."
+            detail: "Not run yet. It runs automatically once the mint links up, or run the \
+                     self-test from the Mint tab."
                 .into(),
             remedy: None,
         },
@@ -634,7 +680,7 @@ pub async fn run_self_test(
                 ),
                 Some(_) => {
                     if let Err(e) = branch
-                        .mark_failed(&ticket_id, Some(SELF_TEST_NOTE.to_string()))
+                        .mark_failed(&ticket_id, Some(SELF_TEST_NOTE.to_string()), None)
                         .await
                     {
                         tracing::warn!("could not void self-test ticket {ticket_id}: {e:#}");
@@ -688,7 +734,7 @@ pub async fn run_self_test(
                     ),
                     Some(_) => {
                         if let Err(e) = branch
-                            .mark_failed(&ticket_id, Some(SELF_TEST_NOTE.to_string()))
+                            .mark_failed(&ticket_id, Some(SELF_TEST_NOTE.to_string()), None)
                             .await
                         {
                             tracing::warn!("could not void self-test ticket {ticket_id}: {e:#}");
@@ -780,6 +826,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const NOW: u64 = 1_800_000_000;
+
     fn info_with(methods4: Value, methods5: Value) -> Value {
         json!({
             "name": "Test Mint",
@@ -796,6 +844,7 @@ mod tests {
         keysets: Option<&'a anyhow::Result<Vec<KeysetEntry>>>,
     ) -> ChecklistInputs<'a> {
         ChecklistInputs {
+            now: NOW,
             unit: "ora",
             method: "branch",
             mint_url: "http://mint:8089",
@@ -814,6 +863,7 @@ mod tests {
     #[test]
     fn unattached_setup_reports_unknowns() {
         let inputs = ChecklistInputs {
+            now: NOW,
             unit: "",
             mint_url: "",
             method: "branch",
@@ -926,6 +976,37 @@ mod tests {
 
         let none: anyhow::Result<Vec<KeysetEntry>> = Ok(vec![]);
         let checks = evaluate(&base_inputs(None, Some(&none)));
+        assert_eq!(status_of(&checks, "keyset"), CheckStatus::Fail);
+    }
+
+    #[test]
+    fn active_keyset_expiry() {
+        let expiring = |final_expiry: u64| -> anyhow::Result<Vec<KeysetEntry>> {
+            Ok(vec![KeysetEntry {
+                id: "01abcd".into(),
+                unit: "ora".into(),
+                active: true,
+                input_fee_ppk: 0,
+                final_expiry: Some(final_expiry),
+            }])
+        };
+        let far = expiring(NOW + 365 * 86_400);
+        let checks = evaluate(&base_inputs(None, Some(&far)));
+        assert_eq!(status_of(&checks, "keyset"), CheckStatus::Ok);
+
+        let soon = expiring(NOW + 10 * 86_400);
+        let checks = evaluate(&base_inputs(None, Some(&soon)));
+        let keyset = checks.iter().find(|c| c.id == "keyset").unwrap();
+        assert_eq!(keyset.status, CheckStatus::Warn);
+        assert!(keyset.detail.contains("10 days"));
+
+        // Expiry is strict: the keyset still works at exactly its expiry.
+        let now = expiring(NOW);
+        let checks = evaluate(&base_inputs(None, Some(&now)));
+        assert_eq!(status_of(&checks, "keyset"), CheckStatus::Warn);
+
+        let past = expiring(NOW - 1);
+        let checks = evaluate(&base_inputs(None, Some(&past)));
         assert_eq!(status_of(&checks, "keyset"), CheckStatus::Fail);
     }
 

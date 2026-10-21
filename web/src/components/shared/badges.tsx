@@ -1,6 +1,7 @@
 import { X } from "lucide-react"
 
 import type { KeysetEntry, TicketStatus } from "@/lib/api"
+import { isKeysetExpired } from "@/lib/keysets"
 import { Badge } from "@/components/ui/badge"
 
 /** Grayscale ticket status: solid = paid, outline = in progress, X = failed. */
@@ -17,9 +18,12 @@ export function StatusBadge({ status }: { status: TicketStatus }) {
   return <Badge variant="outline">{label}</Badge>
 }
 
+/**
+ * Keyset state: solid = issuing new ecash, muted = redeem-only (inactive but
+ * its ecash still valid), outline + X = expired.
+ */
 export function KeysetBadge({ keyset, now }: { keyset: KeysetEntry; now: number }) {
-  const expired = keyset.final_expiry != null && keyset.final_expiry <= now
-  if (expired)
+  if (isKeysetExpired(keyset, now))
     return (
       <Badge variant="outline">
         <X />
@@ -27,5 +31,5 @@ export function KeysetBadge({ keyset, now }: { keyset: KeysetEntry; now: number 
       </Badge>
     )
   if (keyset.active) return <Badge variant="solid">Active</Badge>
-  return <Badge variant="muted">Inactive</Badge>
+  return <Badge variant="muted">Redeem-only</Badge>
 }

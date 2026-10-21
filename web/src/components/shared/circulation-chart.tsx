@@ -8,20 +8,42 @@ import {
   YAxis,
 } from "recharts"
 
-import type { CirculationPoint } from "@/lib/api"
-import { compactNumber, formatAmount, formatDateTime, formatSignedAmount } from "@/lib/format"
+import type { CirculationDay } from "@/lib/api"
+import { compactNumber, formatAmount, formatSignedAmount } from "@/lib/format"
+import { useCirculation } from "@/lib/use-circulation"
+import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/shared/bits"
 
-export function CirculationChart({ data, unit }: { data: CirculationPoint[]; unit: string }) {
-  const chartData = data.map((point) => ({
-    ...point,
-    label: new Date(point.ts * 1000).toLocaleDateString(undefined, {
-      month: "short",
-      day: "numeric",
-    }),
-  }))
+export const CHART_RANGES = [
+  { value: "7", label: "7D" },
+  { value: "30", label: "30D" },
+  { value: "90", label: "90D" },
+  { value: "365", label: "1Y" },
+  { value: "all", label: "All" },
+] as const
 
-  if (chartData.length === 0) {
+export type ChartRange = (typeof CHART_RANGES)[number]["value"]
+
+/** Net settled per day (deposits minus payouts, running), one point per day. */
+export function CirculationChart({
+  unit,
+  range,
+  refreshKey,
+}: {
+  unit: string
+  range: ChartRange
+  refreshKey: string
+}) {
+  const { data, error } = useCirculation(range === "all" ? undefined : Number(range), refreshKey)
+
+  if (!data) {
+    return error ? (
+      <p className="m-0 text-sm text-muted-foreground">Could not load the settled history: {error}</p>
+    ) : (
+      <Skeleton className="h-[300px] w-full" />
+    )
+  }
+  if (data.length === 0) {
     return (
       <EmptyState
         title="No circulation history yet"
@@ -29,6 +51,18 @@ export function CirculationChart({ data, unit }: { data: CirculationPoint[]; uni
       />
     )
   }
+
+  const crossesYears =
+    new Date(data[0].start * 1000).getFullYear() !==
+    new Date(data[data.length - 1].start * 1000).getFullYear()
+  const chartData = data.map((day) => ({
+    ...day,
+    label: new Date(day.start * 1000).toLocaleDateString(undefined, {
+      year: crossesYears ? "2-digit" : undefined,
+      month: "short",
+      day: "numeric",
+    }),
+  }))
 
   return (
     <div className="h-[300px] w-full">
@@ -46,6 +80,7 @@ export function CirculationChart({ data, unit }: { data: CirculationPoint[]; uni
             tickLine={false}
             axisLine={false}
             tickMargin={10}
+            minTickGap={24}
             tick={{ fill: "var(--muted-foreground)", fontSize: 12 }}
           />
           <YAxis
@@ -62,6 +97,7 @@ export function CirculationChart({ data, unit }: { data: CirculationPoint[]; uni
             stroke="var(--chart-1)"
             strokeWidth={2}
             fill="url(#circulationFill)"
+            dot={false}
             activeDot={{ r: 4, fill: "var(--chart-1)", stroke: "var(--background)" }}
           />
         </AreaChart>
@@ -76,20 +112,25 @@ function ChartTooltip({
   unit,
 }: {
   active?: boolean
-  payload?: Array<{ payload: CirculationPoint }>
+  payload?: Array<{ payload: CirculationDay }>
   unit: string
 }) {
   if (!active || !payload?.length) return null
-  const point = payload[0].payload
+  const day = payload[0].payload
   return (
     <div className="rounded-md border bg-popover px-3 py-2 text-popover-foreground shadow-md">
-      <div className="text-xs font-medium text-muted-foreground">{formatDateTime(point.ts)}</div>
-      <div className="mt-1 text-sm font-semibold">
-        {formatSignedAmount(point.circulation, unit)}
+      <div className="text-xs font-medium text-muted-foreground">
+        {new Date(day.start * 1000).toLocaleDateString(undefined, {
+          weekday: "short",
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        })}
       </div>
+      <div className="mt-1 text-sm font-semibold">{formatSignedAmount(day.circulation, unit)}</div>
       <div className="text-xs text-muted-foreground">
-        Delta {point.delta > 0 ? "+" : ""}
-        {formatAmount(point.delta, unit)}
+        In {formatAmount(day.deposits, unit)} ({day.deposit_count}) · Out{" "}
+        {formatAmount(day.payouts, unit)} ({day.payout_count})
       </div>
     </div>
   )

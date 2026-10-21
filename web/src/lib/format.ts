@@ -36,11 +36,43 @@ export function formatCountdown(until: number, now: number) {
   return `${delta}s`
 }
 
+function isThisYear(ts: number) {
+  return new Date(ts * 1000).getFullYear() === new Date().getFullYear()
+}
+
+/** Date and time; the year appears once it is not the current one. */
 export function formatDateTime(ts: number) {
   return new Date(ts * 1000).toLocaleString(undefined, {
+    year: isThisYear(ts) ? undefined : "numeric",
     month: "short",
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
   })
+}
+
+/** "Oct 20, 2027" — calendar dates (expiries, starts) always carry the year. */
+export function formatDate(ts: number) {
+  return new Date(ts * 1000).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  })
+}
+
+/** Coarse length for long horizons: "45 min", "5 h", "12 days", "11 months", "2 years". */
+export function formatSpan(seconds: number) {
+  const secs = Math.abs(seconds)
+  if (secs < 3600) return `${Math.max(1, Math.round(secs / 60))} min`
+  if (secs < 2 * 86_400) return `${Math.round(secs / 3600)} h`
+  const days = Math.round(secs / 86_400)
+  if (days < 60) return `${days} days`
+  const months = Math.round(days / 30.44)
+  if (months < 24) return `${months} months`
+  return `${Math.round(days / 365.25)} years`
+}
+
+/** "in 11 months" / "3 days ago" */
+export function formatRelative(ts: number, now: number) {
+  return ts >= now ? `in ${formatSpan(ts - now)}` : `${formatSpan(now - ts)} ago`
 }

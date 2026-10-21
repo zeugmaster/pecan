@@ -75,10 +75,11 @@ match-first: the operator resolves the customer's wallet-created quote by its
 id (typed tail or scan), then settles it — oversized controls, at most two big
 buttons per step, and an open-quote list whose ids stay truncated so nothing
 can be settled without the customer's code. The **Operator Console** is a
-tabbed workspace (Overview, Mint, Access) for everything an administrator
-does; the Mint tab carries the attachment checklist that verifies the
-operator's own cdk-mintd. There is no setup wizard; the stack bootstraps
-itself and everything is edited on the running instance.
+tabbed workspace (Overview, Mint, Keys, Activity, Access) for everything an
+administrator does; the Mint tab carries the attachment checklist that
+verifies the operator's own cdk-mintd, the Keys tab its keysets' lifetimes.
+There is no setup wizard; the stack bootstraps itself and everything is
+edited on the running instance.
 
 **Key Characteristics:**
 - Strict grayscale: every color token is chroma-0 oklch, light and dark.
@@ -184,16 +185,39 @@ for destructive confirmation with the solid-cancel/outline-confirm
 convention.
 
 ### The Checklist (Mint tab)
-The attachment checklist is the console's signature surface: five rows, each
-an icon + title + status badge + plain-language detail, with the remedy — when
-one exists — in a muted bordered block underneath. Statuses follow the
-Variant Carries Meaning Rule (solid OK, outline Warning/Failing with an X,
-muted Waiting); icons are `CircleCheck`, `TriangleAlert`, `CircleAlert`,
-`CircleDashed`. Remedies are complete sentences an operator can act on
-without reading cdk source.
+The attachment checklist is the console's signature surface, status first.
+The Mint tab opens on one card that answers "is it working?": a headline
+sentence decided by the first failing check (else warning, else waiting),
+a five-segment strip — one per check, with a plain step name, its icon, and a
+status word — and the single next step (that check's remedy in a muted
+bordered block, or the self-test button when only the test is missing).
+Segments follow the Variant Carries Meaning Rule: solid OK, outline
+Warning/Failing, muted Waiting. The full rows — icon + title + status badge +
+detail + remedy — and the self-test result sit one click away. Icons are
+`CircleCheck`, `TriangleAlert`, `CircleAlert`, `CircleDashed`. Remedies are
+complete sentences an operator can act on without reading cdk source.
+
+### Disclosures
+Secondary and technical detail folds behind a chevron row (native
+`<details>`): full checks, the config snippet, protocol facts, advanced form
+fields. Rows span the card edge to edge with a top border; a short muted hint
+may sit on the right. Detail opens by default only while it is the next thing
+the operator needs (the snippet until the mint has attached).
+
+### The Key Timeline (Keys tab)
+One lane per keyset on a shared time axis, newest first, with a 1px
+foreground "Today" rule. Fill carries the phase, never hue: solid `primary`
+while the keyset issues new ecash, `chart-3` hatching while its ecash is
+redeem-only, muted fill once expired, a dashed outline before this console
+first saw it (start unknown) or for the "if rotated today" preview. A bar ends
+at the final expiry; an arrow at the edge means no expiry. Every lane also
+carries a status badge (Active / Redeem-only / Expired) and a date in words,
+and a tooltip with exact dates. The console only reads keys; rotation is
+handed over as an exact `cdk-mint-cli` command.
 
 ### Tabs
-The console's three sections (Overview | Mint | Access) in a `muted` rail;
+The console's five sections (Overview | Mint | Keys | Activity | Access) in a
+`muted` rail;
 the active trigger lifts to `background`. Tabs sync to the URL hash so
 `/#mint` deep-links survive refresh. A trigger may carry a small dot for
 needs-attention states (failing checklist, demo password).
@@ -202,6 +226,13 @@ needs-attention states (failing checklist, demo password).
 Shadcn tables inside cards (`px-0` content, first/last cells padded `24px`).
 Headers are normal-case `14px` medium muted text. Identifiers use mono chips.
 Wide tables scroll horizontally inside the card.
+
+### Long lists
+Nothing grows without bound. The open-quote list shows ten rows, then "Show
+all N"; settled history pages by 25, newest first, with Newer / Older and a
+CSV export of the current filters. Filters are segmented controls in the tab
+rail's look (muted track, selected option lifted). Relative times ("3h ago")
+show the exact date and time on hover.
 
 ### Inputs
 Stock shadcn inputs. **No read-only inputs**: facts render as text detail

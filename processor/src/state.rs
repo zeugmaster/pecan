@@ -79,6 +79,12 @@ pub struct Ticket {
     /// wallet).
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// When the ticket was voided (paid tickets carry `paid_at` instead).
+    #[serde(default)]
+    pub voided_at: Option<u64>,
+    /// The console user who settled or voided the ticket at the counter.
+    #[serde(default)]
+    pub operator: Option<String>,
 }
 
 impl Ticket {
@@ -102,6 +108,8 @@ impl Ticket {
             description,
             notes: None,
             expires_at,
+            voided_at: None,
+            operator: None,
         }
     }
 
@@ -126,11 +134,19 @@ impl Ticket {
             description,
             notes: None,
             expires_at,
+            voided_at: None,
+            operator: None,
         }
     }
 
     pub fn expired(&self, now: u64) -> bool {
         self.expires_at.is_some_and(|e| now > e)
+    }
+
+    /// When the ticket left the open list: settled, voided, or (for rows
+    /// that predate `voided_at`) created. Orders and dates the history.
+    pub fn closed_at(&self) -> u64 {
+        self.paid_at.or(self.voided_at).unwrap_or(self.created_at)
     }
 
     pub fn unit_typed(&self) -> CurrencyUnit {
@@ -415,7 +431,13 @@ impl BranchState {
     /// wallet sees the melt finalize immediately instead of on its next poll.
     /// Events fire only on an actual `Pending → Paid` transition — a repeated
     /// confirm is a no-op and a voided ticket is rejected outright.
-    pub async fn mark_paid(&self, id: &str, notes: Option<String>) -> Result<Ticket> {
+    /// `operator` is the console user confirming, recorded for the history.
+    pub async fn mark_paid(
+        &self,
+        id: &str,
+        notes: Option<String>,
+        operator: Option<String>,
+    ) -> Result<Ticket> {
         let (updated, transitioned) = {
             let mut t = self.inner.tickets.write().await;
             let ticket = t
@@ -436,6 +458,7 @@ impl BranchState {
                     }
                     ticket.status = TicketStatus::Paid;
                     ticket.paid_at = Some(unix_now());
+                    ticket.operator = operator;
                     if let Some(n) = notes {
                         ticket.notes = Some(n);
                     }
@@ -473,7 +496,12 @@ impl BranchState {
     /// Void a ticket. For a funded melt (proofs locked at the mint) a
     /// `PaymentFailed` event is pushed so the mint releases the customer's
     /// proofs immediately.
-    pub async fn mark_failed(&self, id: &str, notes: Option<String>) -> Result<Ticket> {
+    pub async fn mark_failed(
+        &self,
+        id: &str,
+        notes: Option<String>,
+        operator: Option<String>,
+    ) -> Result<Ticket> {
         let (updated, was_funded_melt) = {
             let mut t = self.inner.tickets.write().await;
             let ticket = t
@@ -486,6 +514,8 @@ impl BranchState {
                 ticket.kind == TicketKind::Outgoing && ticket.status == TicketStatus::Pending;
             if ticket.status != TicketStatus::Failed {
                 ticket.status = TicketStatus::Failed;
+                ticket.voided_at = Some(unix_now());
+                ticket.operator = operator;
                 if let Some(n) = notes {
                     ticket.notes = Some(n);
                 }
@@ -753,7 +783,7 @@ mod tests {
             .insert_open(incoming("0198c0ef-3f11-7abc-9def-aaaaaa9ec0f4", 500))
             .await
             .unwrap();
-        state.mark_paid(&t.id, None).await.unwrap();
+        state.mark_paid(&t.id, None, None).await.unwrap();
 
         let query = normalize_match_input("9ec0f4").unwrap();
         assert!(matches!(
@@ -773,12 +803,17 @@ mod tests {
             .unwrap();
         let mut rx = state.subscribe_events();
 
-        let paid = state.mark_paid(&t.id, Some("till #1".into())).await.unwrap();
+        let paid = state
+            .mark_paid(&t.id, Some("till #1".into()), Some("teller".into()))
+            .await
+            .unwrap();
         assert_eq!(paid.status, TicketStatus::Paid);
+        assert_eq!(paid.operator.as_deref(), Some("teller"));
+        assert_eq!(paid.closed_at(), paid.paid_at.unwrap());
         assert!(matches!(rx.try_recv(), Ok(Event::PaymentReceived(_))));
 
         // repeated confirm is a no-op and must not double-credit
-        let again = state.mark_paid(&t.id, None).await.unwrap();
+        let again = state.mark_paid(&t.id, None, None).await.unwrap();
         assert_eq!(again.status, TicketStatus::Paid);
         assert!(rx.try_recv().is_err());
     }
@@ -790,15 +825,15 @@ mod tests {
             .insert_open(incoming("0198c0ef-3f11-7abc-9def-aaaaaa9ec0f4", 500))
             .await
             .unwrap();
-        state.mark_failed(&t.id, None).await.unwrap();
+        state.mark_failed(&t.id, None, None).await.unwrap();
         let mut rx = state.subscribe_events();
-        assert!(state.mark_paid(&t.id, None).await.is_err());
+        assert!(state.mark_paid(&t.id, None, None).await.is_err());
         assert!(rx.try_recv().is_err(), "voided ticket must not emit payment");
 
         let mut expired = incoming("0198c0ef-3f11-7abc-9def-bbbbbb111111", 700);
         expired.expires_at = Some(unix_now() - 1);
         let expired = state.insert_open(expired).await.unwrap();
-        assert!(state.mark_paid(&expired.id, None).await.is_err());
+        assert!(state.mark_paid(&expired.id, None, None).await.is_err());
     }
 
     #[tokio::test]
@@ -815,7 +850,7 @@ mod tests {
         assert!(state.insert_open(incoming(quote, 999)).await.is_err());
 
         // settled ids can never be re-registered
-        state.mark_paid(&t.id, None).await.unwrap();
+        state.mark_paid(&t.id, None, None).await.unwrap();
         assert!(state.insert_open(incoming(quote, 500)).await.is_err());
     }
 
@@ -844,13 +879,13 @@ mod tests {
         assert_eq!(t.status, TicketStatus::Waiting);
 
         // wallet has not locked funds → no payout
-        assert!(state.mark_paid(&t.id, None).await.is_err());
+        assert!(state.mark_paid(&t.id, None, None).await.is_err());
 
         // wallet funds the melt → Pending, payout allowed, success event fires
         let funded = state.mark_outgoing_submitted(&t.id).await.unwrap();
         assert_eq!(funded.status, TicketStatus::Pending);
         let mut rx = state.subscribe_events();
-        let paid = state.mark_paid(&t.id, None).await.unwrap();
+        let paid = state.mark_paid(&t.id, None, None).await.unwrap();
         assert_eq!(paid.status, TicketStatus::Paid);
         assert!(matches!(
             rx.try_recv(),
@@ -869,7 +904,7 @@ mod tests {
             .insert_open(outgoing("0198c0ef-3f11-7abc-9def-aaaaaa9ec0f4", 700))
             .await
             .unwrap();
-        state.mark_failed(&t.id, None).await.unwrap();
+        state.mark_failed(&t.id, None, None).await.unwrap();
         assert!(state.mark_outgoing_submitted(&t.id).await.is_err());
 
         let f = state
@@ -878,8 +913,14 @@ mod tests {
             .unwrap();
         state.mark_outgoing_submitted(&f.id).await.unwrap();
         let mut rx = state.subscribe_events();
-        state.mark_failed(&f.id, Some("customer left".into())).await.unwrap();
+        let voided = state
+            .mark_failed(&f.id, Some("customer left".into()), Some("teller".into()))
+            .await
+            .unwrap();
         assert!(matches!(rx.try_recv(), Ok(Event::PaymentFailed { .. })));
+        assert_eq!(voided.operator.as_deref(), Some("teller"));
+        assert!(voided.voided_at.is_some());
+        assert_eq!(voided.closed_at(), voided.voided_at.unwrap());
     }
 
     #[tokio::test]
