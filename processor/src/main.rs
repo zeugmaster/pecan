@@ -21,6 +21,7 @@ mod checks;
 mod clients;
 mod config;
 mod keysets;
+mod mint_auth;
 mod sessions;
 mod state;
 mod timefmt;
@@ -114,10 +115,11 @@ async fn main() -> Result<()> {
     // sessions are operational scratch and live in the work dir.
     let users_path = config_dir.join("users.json");
     let sessions_path = work_dir.join("sessions.json");
+    let mint_auth = mint_auth::MintAuth::load(config_dir.join("mint-auth.json")).await?;
     // The managed-stack era mirrored setup.json into the work dir; register
     // it as a legacy migration source for installs upgrading mid-loss.
-    let config_store = ConfigStore::new(config_dir)
-        .with_legacy_mirror(work_dir.join("managed-stack-backup.json"));
+    let config_store =
+        ConfigStore::new(config_dir).with_legacy_mirror(work_dir.join("managed-stack-backup.json"));
 
     let grpc_addr = std::env::var(ENV_GRPC_ADDR).unwrap_or_else(|_| DEFAULT_GRPC_ADDR.into());
     let grpc_port: u16 = std::env::var(ENV_GRPC_PORT)
@@ -282,6 +284,7 @@ async fn main() -> Result<()> {
         backend.clone(),
         self_test.clone(),
         self_test_running.clone(),
+        mint_auth.clone(),
     );
 
     let app = web::router(web::WebState::new(
@@ -298,6 +301,7 @@ async fn main() -> Result<()> {
         self_test,
         self_test_running,
         keyset_log,
+        mint_auth,
     ));
 
     tracing::info!("branch-processor HTTP on {http_socket}");
@@ -369,6 +373,7 @@ fn spawn_self_test_on_first_attach(
     backend: Arc<BranchBackend>,
     self_test: Arc<RwLock<Option<SelfTestOutcome>>>,
     running: Arc<AtomicBool>,
+    mint_auth: mint_auth::MintAuth,
 ) {
     tokio::spawn(async move {
         loop {
@@ -389,7 +394,7 @@ fn spawn_self_test_on_first_attach(
             }
             tracing::info!("mint attached — running the end-to-end self-test");
             let outcome = checks::run_self_test(
-                &MintHttpClient::new(snapshot.mint_url.clone()),
+                &MintHttpClient::new(snapshot.mint_url.clone()).with_auth(mint_auth.clone()),
                 &branch,
                 &snapshot.method,
                 &snapshot.unit,

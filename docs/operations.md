@@ -84,7 +84,7 @@ Everything happens in the console's **Mint tab**:
    pre-seed this step with `mintctl install --unit <u> --mint-url <url>`.)
 2. Apply the generated **config snippet** to your mintd. cdk-mintd 0.18+
    keeps its configuration in the mint database, so a mint.toml on disk is an
-   import document: fresh mint — `cdk-mintd config init --file mint.toml`,
+   import document: fresh mint — `cdk-mintd config init --new-mint --file mint.toml`,
    then start it; running mint — `cdk-mintd config export --file mint.toml`,
    merge the snippet, `cdk-mintd config apply --file mint.toml`, restart.
    Editing the file without `config apply` changes nothing. A complete
@@ -97,16 +97,77 @@ Everything happens in the console's **Mint tab**:
    at this processor, then voids them. It also measures the mint's quote
    lifetimes and warns when they are too short for a counter visit.
 
-Compatibility: your mintd must run cdk-mintd v0.18.0-rc.0 or later — the
-first release whose payment-processor protocol (4.0.0, strict equality at
-connect time) carries the quote id on custom mint quotes. The official
-docker image `cashubtc/mintd:0.18.0-rc.0` is the easiest way to run one.
+Compatibility: wallet authentication is tested against cdk-mintd **0.18.2**,
+with payment-processor protocol **4.0.0**. Pecan's dependencies, installer and
+bundled image default are pinned to this release. Existing installations keep
+their explicit image pin until upgraded; changing a default does not upgrade a
+running mint. Back up its database and seed before updating it.
 
 The **unit locks** after the first successful self-test: issued ecash and
 quotes reference it. Changing a locked unit means starting over deliberately —
 stop the processor, edit `unit` and `unit_locked` in `setup.json` on the
 config volume, and accept that existing tickets for the old unit remain
 history-only.
+
+## Wallet authentication
+
+Open **Access → Wallet access**. Pecan reads NUT-21 and NUT-22 from the attached
+mint's `/v1/info` and shows the active policy for `branch`. The endpoint disclosure
+also shows policies for other methods. If discovery fails, the active policy is
+unknown; a saved draft is never treated as evidence of activation.
+
+Choose **Open**, **Clear auth**, or **Blind auth** for deposit quotes, quote
+lookups, issuance, withdrawal quotes, redemption, swaps, restore, proof checks
+and WebSocket subscriptions. CDK's configuration applies each operation's setting
+across **all payment methods**, not just the branch backend. Protecting swaps
+also requires authentication when receiving ecash.
+
+- Clear auth sends an identity-provider access token with each protected request.
+- Blind auth uses one-use, denomination-one authorization proofs. A wallet signs
+  in to obtain a batch, then spends a proof on each protected request. These are
+  not monetary ecash and do not change a wallet's funds.
+- The batch maximum is a per-request cap, not a per-user quota or cash limit.
+  Account enrollment, access rules and sign-in methods belong to the identity
+  provider. Disabling an account does not invalidate already issued blind proofs.
+  Blind signatures prevent linking issuance to redemption cryptographically;
+  timing and network metadata remain visible.
+
+**Saving a draft does not change the mint.** Export the mint's full configuration
+using `cdk-mintd --work-dir <mint-data> config export --file mint.toml`, replace
+its `[auth]` block with Pecan's saved snippet, review the whole document, apply
+it with `config apply --file mint.toml`, and restart mintd. Preserve existing
+payment backends, key settings and management RPC configuration. Do not apply
+an auth-only fragment as a complete configuration. Refresh policy in Pecan to
+verify the change.
+
+If quote creation or lookup is protected, choose **Connect processor**. Pecan
+uses the *active* mint's OpenID discovery URL and client ID, displays the
+provider's verification URL and user code, and waits for approval. Configure a
+public OpenID client supporting device authorization; customer wallets may
+use other flows offered by that provider. Pecan does not collect the provider's
+password or host a customer wallet. Use HTTPS for the mint, discovery document,
+and provider endpoints; plain HTTP is accepted only on loopback for local tests.
+
+Pecan refreshes its session when available and obtains blind tokens on demand.
+It verifies their DLEQ proofs with CDK, strips DLEQ information from redemption
+headers, and removes each token from durable storage **before** dispatching the
+request. Failed or interrupted requests therefore consume authorization tokens.
+It does not retry monetary operations automatically. Tokens are bound to the
+mint URL, discovery URL and client ID, and cannot follow a changed attachment.
+Quote matching, settlement cross-checks and the Mint self-test all use this
+connection. Rerun the self-test after connecting.
+
+**Disconnect processor** deletes its locally stored credentials and cancels
+pending sign-in. It does not revoke identity-provider sessions or sign customer
+wallets out. The private `mint-auth.json` file in the processor config directory
+contains access/refresh tokens and unused blind proofs; keep its directory and
+backups private. On Unix the file is written with mode `0600`. Do not restore
+an old copy of the blind-token pool: proofs may already have been consumed.
+The existing Pecan access model is unchanged: all staff accounts can configure
+and disconnect this shared processor connection.
+
+Reproducible wallet compatibility checks and their limits are documented in
+[`tests/auth/README.md`](../tests/auth/README.md).
 
 ## Running the bundled mint
 

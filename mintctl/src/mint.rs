@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 /// The cashubtc/mintd image tag new bundled-mint installs pin. Must agree
 /// with COMPATIBLE_CDK_VERSION in processor/src/config.rs and the default in
 /// docker-compose.yml — CI's pin-check greps all mintd tag references.
-pub const MINTD_DEFAULT_TAG: &str = "0.18.0-rc.0";
+pub const MINTD_DEFAULT_TAG: &str = "0.18.2";
 
 /// Units wallets treat specially (or that invite confusion with real
 /// currencies). Not rejected — a warning nudges the operator toward a name

@@ -20,12 +20,12 @@ use serde::{Deserialize, Serialize};
 
 pub const PASSWORD_MIN_LENGTH: usize = 8;
 
-/// The minimum cdk release the attached cdk-mintd must run. What actually
+/// The tested CDK release for wallet authentication. What actually
 /// gates the link is strict equality of the payment-processor protocol
 /// version ([`cdk_common::PAYMENT_PROCESSOR_PROTOCOL_VERSION`]); this release
-/// is the first that speaks it. Keep in lockstep with processor/Cargo.toml —
+/// is pinned in processor/Cargo.toml. Keep the versions aligned —
 /// CI's pin-check enforces the pair.
-pub const COMPATIBLE_CDK_VERSION: &str = "0.18.0-rc.0";
+pub const COMPATIBLE_CDK_VERSION: &str = "0.18.2";
 
 /// The official docker image operators can run instead of building cdk-mintd
 /// themselves.
@@ -100,9 +100,9 @@ impl ConfigStore {
             let raw = tokio::fs::read(&path)
                 .await
                 .with_context(|| format!("read {}", path.display()))?;
-            return Ok(Some(parse_config(&raw).with_context(|| {
-                format!("parse {}", path.display())
-            })?));
+            return Ok(Some(
+                parse_config(&raw).with_context(|| format!("parse {}", path.display()))?,
+            ));
         }
         Ok(None)
     }
@@ -162,6 +162,8 @@ fn parse_config(raw: &[u8]) -> Result<LoadedConfig> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub wallet_auth: Option<crate::mint_auth::AuthDraft>,
     pub version: u32,
     pub configured_at: u64,
     /// The custom payment method this processor implements. Constant in
@@ -198,6 +200,7 @@ pub struct AppConfig {
 pub fn bootstrap_config(configured_at: u64) -> AppConfig {
     AppConfig {
         version: 4,
+        wallet_auth: None,
         configured_at,
         method: "branch".to_string(),
         unit: String::new(),
@@ -227,6 +230,9 @@ pub fn apply_initial_attachment(
 
 impl AppConfig {
     pub fn validate(&self) -> Result<()> {
+        if let Some(draft) = &self.wallet_auth {
+            draft.validate()?;
+        }
         if self.method.trim().is_empty() {
             bail!("payment method is required");
         }
@@ -318,17 +324,17 @@ pub fn render_mint_snippet(config: &AppConfig, grpc_tls: bool) -> Option<String>
     Some(format!(
         r#"# Branch settlement backend — add to your cdk-mintd's stored configuration.
 #
-# cdk-mintd {version}+ keeps its configuration in the mint database:
-#   fresh mint:    cdk-mintd config init --file mint.toml   (then start it)
+# cdk-mintd {version} keeps its configuration in the mint database:
+#   fresh mint:    cdk-mintd config init --new-mint --file mint.toml   (then start it)
 #   running mint:  cdk-mintd config export --file mint.toml
 #                  …merge this snippet into the exported file…
 #                  cdk-mintd config apply --file mint.toml
 #                  then restart cdk-mintd
 # Editing a mint.toml on disk without `config apply` changes nothing.
 #
-# Requires cdk-mintd v{version} or later (docker image {image}) —
-# the payment-processor protocol check (protocol {proto}) is strict, so older
-# builds are rejected at connect time.
+# Tested with cdk-mintd v{version} (docker image {image}) —
+# requires payment-processor protocol {proto}. Mismatched protocol versions
+# are rejected at connect time.
 
 [[payment_backend]]
 backend = "grpcprocessor"
@@ -524,6 +530,7 @@ impl LegacyConfig {
         };
         AppConfig {
             version: 4,
+            wallet_auth: None,
             configured_at: self.configured_at,
             method: self.mint.method,
             // A managed install with a unit has (or had) ecash under it:
@@ -679,7 +686,11 @@ mod tests {
     fn attachment_setup_and_snippet() {
         let mut config = bootstrap_config(1);
         config
-            .set_attachment(Some("ORA"), "https://mint.example.org/", "http://10.0.0.5:50051")
+            .set_attachment(
+                Some("ORA"),
+                "https://mint.example.org/",
+                "http://10.0.0.5:50051",
+            )
             .expect("setup");
         assert_eq!(config.unit, "ora");
         assert_eq!(config.mint_url, "https://mint.example.org");

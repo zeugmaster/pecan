@@ -86,7 +86,7 @@ against the accounting refactor (`04cbe81c`). None affect the ticket model.
 repinned to crates.io `=0.18.0-rc.0` (zero code drift — the PR-head pin already matched
 the merged API), `COMPATIBLE_CDK_REV` became `COMPATIBLE_CDK_VERSION`,
 `docker/mintd/Dockerfile` deleted; operators run the official
-`cashubtc/mintd:0.18.0-rc.0` image. The 0.18 config model (database-authoritative,
+`cashubtc/mintd` image at version 0.18.0-rc.0. The 0.18 config model (database-authoritative,
 `config init`/`config apply`, `[[ln]]` → `[[payment_backend]]`) is reflected in the
 snippet renderer and checklist remedies.*
 
@@ -472,7 +472,7 @@ before deleting the old model), 2 and 3 can interleave.
    any external mint.
    *Revisited 2026-08-18: a compose-managed mint returns as an opt-in installer mode
    (`--with-mint`). The 2026-08 objection was the temporary fork-built image; with
-   #2295 shipped in the stock `cashubtc/mintd:0.18.0-rc.0` image that objection is
+   #2295 shipped in the stock `cashubtc/mintd` image at version 0.18.0-rc.0 that objection is
    gone. The mint stays stock and self-contained — installer-written import document,
    seed shown once + carried in backups, image pinned independently of pecan releases;
    the console still only verifies. Processor side: the `CDK_BRANCH_PROCESSOR_INITIAL_*`
