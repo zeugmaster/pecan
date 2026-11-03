@@ -18,10 +18,11 @@ use serde_json::Value;
 /// never hang the console snapshot — keep the timeout short.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MintHttpClient {
     base: Arc<String>,
     http: reqwest::Client,
+    auth: Option<crate::mint_auth::MintAuth>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -83,12 +84,37 @@ impl MintHttpClient {
     pub fn new(base: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default();
+            .expect("static mint HTTP client configuration");
         Self {
             base: Arc::new(base.into()),
             http,
+            auth: None,
         }
+    }
+
+    pub fn with_auth(mut self, auth: crate::mint_auth::MintAuth) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    async fn authorized(
+        &self,
+        request: reqwest::RequestBuilder,
+        method: &str,
+        route: &str,
+    ) -> Result<reqwest::RequestBuilder> {
+        let Some(auth) = &self.auth else {
+            return Ok(request);
+        };
+        let policy = crate::mint_auth::Policy::from_info(&self.get_info().await?)?;
+        Ok(
+            match auth.header(self.base(), &policy, method, route).await? {
+                Some((name, value)) => request.header(name, value),
+                None => request,
+            },
+        )
     }
 
     fn base(&self) -> &str {
@@ -135,8 +161,12 @@ impl MintHttpClient {
         let base = self.base();
         let url = format!("{base}/v1/mint/quote/{method}/{quote_id}");
         let r = self
-            .http
-            .get(&url)
+            .authorized(
+                self.http.get(&url),
+                "GET",
+                &format!("/v1/mint/quote/{method}"),
+            )
+            .await?
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
@@ -158,8 +188,12 @@ impl MintHttpClient {
         let base = self.base();
         let url = format!("{base}/v1/melt/quote/{method}/{quote_id}");
         let r = self
-            .http
-            .get(&url)
+            .authorized(
+                self.http.get(&url),
+                "GET",
+                &format!("/v1/melt/quote/{method}"),
+            )
+            .await?
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
@@ -192,9 +226,12 @@ impl MintHttpClient {
             "pubkey": pubkey,
         });
         let r = self
-            .http
-            .post(&url)
-            .json(&body)
+            .authorized(
+                self.http.post(&url).json(&body),
+                "POST",
+                &format!("/v1/mint/quote/{method}"),
+            )
+            .await?
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -223,9 +260,12 @@ impl MintHttpClient {
             "amount": amount,
         });
         let r = self
-            .http
-            .post(&url)
-            .json(&body)
+            .authorized(
+                self.http.post(&url).json(&body),
+                "POST",
+                &format!("/v1/melt/quote/{method}"),
+            )
+            .await?
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;

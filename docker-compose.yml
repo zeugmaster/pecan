@@ -19,9 +19,8 @@
 #               configured by the installer, dials the processor over the
 #               compose network.
 #
-# Compatibility: an externally-run cdk-mintd must be v0.18.0-rc.0 or later
-# (the payment-processor protocol version is checked strictly at connect
-# time); the console's Mint tab names the required release.
+# Tested pairing: cdk-mintd 0.18.2 with payment-processor protocol 4.0.0.
+# The protocol version is checked strictly at connect time.
 #
 # Every ${VAR} below is documented in .env.example. Production installs are
 # managed by mintctl (see install.sh); from a source checkout,
@@ -106,7 +105,7 @@ services:
           - "${MINT_DOMAIN:-mint-domain.invalid}"
 
   mintd:
-    image: cashubtc/mintd:${MINT_VERSION:-0.18.0-rc.0}
+    image: cashubtc/mintd:${MINT_VERSION:-0.18.2}
     profiles: ["mint"]
     # The official image has no entrypoint script; this mirrors upstream's
     # docker-mintd-entrypoint.sh. `config init` imports the installer-written
@@ -118,7 +117,7 @@ services:
       - -ec
       - |
         if ! cdk-mintd --work-dir /data config show >/dev/null 2>&1; then
-          cdk-mintd --work-dir /data config init --file /config/mint.toml
+          cdk-mintd --work-dir /data config init --new-mint --file /config/mint.toml
         fi
         exec cdk-mintd --work-dir /data
     environment:

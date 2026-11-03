@@ -75,13 +75,14 @@ operations live in [`docs/operations.md`](docs/operations.md).
 
 ## Good to know
 
-- Needs cdk-mintd **v0.18.0-rc.0 or later** — the first release containing
-  [cashubtc/cdk#2295](https://github.com/cashubtc/cdk/pull/2295). The
-  protocol is checked at connect time and the console names the required
-  release. Wallet developers: [`docs/wallet-integration.md`](docs/wallet-integration.md).
+- Tested with cdk-mintd **0.18.2**, using payment-processor protocol **4.0.0**.
+  **Access → Wallet access** prepares clear/blind auth policies and connects
+  the processor to protected quote APIs. Apply the saved config to the mint
+  and restart it to activate changes. See [wallet compatibility tests](tests/auth/README.md).
+  Wallet developers: [`docs/wallet-integration.md`](docs/wallet-integration.md).
 - Deposits are only accepted on wallet-locked quotes (NUT-20), and every
   settlement is cross-checked with the mint first.
-- `mintctl backup` archives hold password hashes and the ticket ledger — and,
+- `mintctl backup` archives hold password hashes, mint auth credentials and the ticket ledger — and,
   with a bundled mint, its database and SEED. Store them encrypted.
 
 ## Development

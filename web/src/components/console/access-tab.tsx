@@ -52,12 +52,14 @@ import {
 } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { Field } from "@/components/shared/bits"
+import { WalletAccess } from "@/components/console/wallet-access"
 
 export function AccessTab({ snapshot }: { snapshot: AppSnapshot }) {
   const me = snapshot.session.username
 
   return (
     <div className="grid gap-4">
+      <WalletAccess key={snapshot.setup.mint_url} mintUrl={snapshot.setup.mint_url} />
       {snapshot.demo_password_active && (
         <Alert variant="emphasis">
           <TriangleAlert />
@@ -70,7 +72,7 @@ export function AccessTab({ snapshot }: { snapshot: AppSnapshot }) {
 
       <Card>
         <CardHeader>
-          <CardTitle>Users</CardTitle>
+          <CardTitle>Pecan staff</CardTitle>
           <CardDescription>
             Every user signs in to both the console and the teller.
           </CardDescription>

@@ -61,6 +61,7 @@ pub struct WebState {
     pub self_test_running: Arc<AtomicBool>,
     /// When the mint's keysets were first seen and seen to stop issuing.
     pub keyset_log: KeysetLog,
+    pub mint_auth: crate::mint_auth::MintAuth,
 }
 
 impl WebState {
@@ -79,6 +80,7 @@ impl WebState {
         self_test: Arc<RwLock<Option<SelfTestOutcome>>>,
         self_test_running: Arc<AtomicBool>,
         keyset_log: KeysetLog,
+        mint_auth: crate::mint_auth::MintAuth,
     ) -> Self {
         Self {
             branch,
@@ -94,6 +96,7 @@ impl WebState {
             self_test,
             self_test_running,
             keyset_log,
+            mint_auth,
         }
     }
 }
@@ -117,6 +120,14 @@ pub fn router(state: WebState) -> Router {
         .route("/api/tickets/{id}/mark-failed", post(api_mark_failed))
         .route("/api/settings/attachment", post(api_set_attachment))
         .route("/api/mint/self-test", post(api_self_test))
+        .route(
+            "/api/mint/auth",
+            get(api_mint_auth)
+                .post(api_mint_auth_save)
+                .delete(api_mint_auth_disconnect),
+        )
+        .route("/api/mint/auth/login", post(api_mint_auth_login))
+        .route("/api/mint/auth/login/{id}", post(api_mint_auth_poll))
         .route("/api/users", post(api_users_create))
         .route("/api/users/{username}", delete(api_users_delete))
         .route(
@@ -480,11 +491,11 @@ struct ApiKeyset {
     deactivated_at: Option<u64>,
 }
 
-fn mint_client_for(config: &AppConfig) -> Option<MintHttpClient> {
+fn mint_client_for(config: &AppConfig, state: &WebState) -> Option<MintHttpClient> {
     if config.mint_url.is_empty() {
         None
     } else {
-        Some(MintHttpClient::new(config.mint_url.clone()))
+        Some(MintHttpClient::new(config.mint_url.clone()).with_auth(state.mint_auth.clone()))
     }
 }
 
@@ -524,7 +535,7 @@ async fn api_app(State(state): State<WebState>, headers: HeaderMap) -> Response 
         .collect();
 
     // Probe the attached mint's public surfaces (short timeouts; see clients.rs).
-    let mint = mint_client_for(&config);
+    let mint = mint_client_for(&config, &state);
     let info_result = match &mint {
         Some(client) => Some(client.get_info().await),
         None => None,
@@ -1021,7 +1032,9 @@ async fn api_match_quote(
     match state.branch.match_open(&query).await {
         MatchResult::Ambiguous(n) => api_error(
             StatusCode::CONFLICT,
-            format!("{n} open quotes end with this code — type more characters or scan the full id"),
+            format!(
+                "{n} open quotes end with this code — type more characters or scan the full id"
+            ),
         ),
         MatchResult::None {
             inactive_match: true,
@@ -1061,7 +1074,7 @@ async fn verify_with_mint(state: &WebState, ticket: &Ticket) -> Result<(), Respo
         ));
     };
     let config = state.config.read().await.clone();
-    let Some(mint) = mint_client_for(&config) else {
+    let Some(mint) = mint_client_for(&config, state) else {
         return Err(api_error(
             StatusCode::BAD_GATEWAY,
             "no mint is attached — set the mint URL in the Mint tab before settling",
@@ -1086,7 +1099,10 @@ async fn verify_with_mint(state: &WebState, ticket: &Ticket) -> Result<(), Respo
                     ))
                 } else if quote.request != ticket.id
                     || quote.amount.is_some_and(|amount| amount != ticket.amount)
-                    || quote.unit.as_deref().is_some_and(|unit| unit != ticket.unit)
+                    || quote
+                        .unit
+                        .as_deref()
+                        .is_some_and(|unit| unit != ticket.unit)
                 {
                     Err(api_error(
                         StatusCode::CONFLICT,
@@ -1121,7 +1137,10 @@ async fn verify_with_mint(state: &WebState, ticket: &Ticket) -> Result<(), Respo
                         "this melt is already settled at the mint",
                     ))
                 } else if quote.amount != ticket.amount
-                    || quote.unit.as_deref().is_some_and(|unit| unit != ticket.unit)
+                    || quote
+                        .unit
+                        .as_deref()
+                        .is_some_and(|unit| unit != ticket.unit)
                 {
                     Err(api_error(
                         StatusCode::CONFLICT,
@@ -1145,6 +1164,16 @@ async fn api_mark_paid(
         Ok(authed) => authed,
         Err(r) => return r,
     };
+    let Some(ticket) = state.branch.get_ticket(&id).await else {
+        return api_error(StatusCode::NOT_FOUND, "quote not found");
+    };
+    if ticket.status == TicketStatus::Paid {
+        return Json(ApiTicket::from_ticket(&ticket)).into_response();
+    }
+    // A match may outlive the processor's mint credentials or the quote itself.
+    if let Err(r) = verify_with_mint(&state, &ticket).await {
+        return r;
+    }
     match mark_paid_inner(&state, &id, form.notes, authed.username).await {
         Ok(ticket) => Json(ApiTicket::from_ticket(&ticket)).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e),
@@ -1192,7 +1221,8 @@ async fn api_set_attachment(
     if let Err(r) = require_api_auth(&state, &headers).await {
         return r;
     }
-    let mut config = state.config.read().await.clone();
+    let mut guard = state.config.write().await;
+    let mut config = guard.clone();
     let before_unit = config.unit.clone();
     let before_url = config.mint_url.clone();
 
@@ -1259,12 +1289,132 @@ async fn api_set_attachment(
     if config.unit != before_unit || config.mint_url != before_url {
         *state.self_test.write().await = None;
     }
-    *state.config.write().await = config;
+    *guard = config;
     state.branch.notify_ui_change();
     Json(ApiMessage { message: "saved" }).into_response()
 }
 
 // ---------------- self-test ----------------
+
+async fn live_auth(config: &AppConfig) -> anyhow::Result<crate::mint_auth::Policy> {
+    anyhow::ensure!(!config.mint_url.is_empty(), "attach a mint first");
+    crate::mint_auth::Policy::from_info(
+        &MintHttpClient::new(config.mint_url.clone())
+            .get_info()
+            .await?,
+    )
+}
+
+async fn api_mint_auth(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_api_auth(&state, &headers).await {
+        return r;
+    }
+    let config = state.config.read().await.clone();
+    let live = live_auth(&config).await;
+    let (policy, error) = match live {
+        Ok(policy) => (Some(policy), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    let connection = state
+        .mint_auth
+        .connection(&config.mint_url, &policy.clone().unwrap_or_default())
+        .await;
+    let operations = policy
+        .as_ref()
+        .map(|p| p.operations(&config.method))
+        .transpose();
+    match operations {
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, e.to_string()),
+        Ok(operations) => Json(serde_json::json!({
+            "active": policy, "operations": operations, "error": error,
+            "connection": connection, "draft": config.wallet_auth,
+            "snippet": config.wallet_auth.as_ref().map(|d| d.snippet()),
+        }))
+        .into_response(),
+    }
+}
+
+async fn api_mint_auth_save(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(draft): Json<crate::mint_auth::AuthDraft>,
+) -> Response {
+    if let Err(r) = require_api_auth(&state, &headers).await {
+        return r;
+    }
+    if let Err(e) = draft.validate() {
+        return api_error(StatusCode::BAD_REQUEST, e.to_string());
+    }
+    let mut config = state.config.write().await;
+    let mut updated = config.clone();
+    updated.wallet_auth = Some(draft);
+    if let Err(e) = state.config_store.save(&updated).await {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    *config = updated;
+    state.branch.notify_ui_change();
+    Json(ApiMessage {
+        message: "draft saved; apply it to the mint and restart to activate",
+    })
+    .into_response()
+}
+
+async fn api_mint_auth_login(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    let authed = match require_api_auth(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let config = state.config.read().await.clone();
+    let result = async {
+        let policy = live_auth(&config).await?;
+        state
+            .mint_auth
+            .start(&config.mint_url, &policy, authed.session_id)
+            .await
+    }
+    .await;
+    match result {
+        Ok(login) => Json(login).into_response(),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, format!("{e:#}")),
+    }
+}
+
+async fn api_mint_auth_poll(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let authed = match require_api_auth(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let config = state.config.read().await.clone();
+    let result = async {
+        let policy = live_auth(&config).await?;
+        state
+            .mint_auth
+            .poll(&config.mint_url, &policy, &authed.session_id, &id)
+            .await
+    }
+    .await;
+    match result {
+        Ok(status) => Json(status).into_response(),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, format!("{e:#}")),
+    }
+}
+
+async fn api_mint_auth_disconnect(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_api_auth(&state, &headers).await {
+        return r;
+    }
+    match state.mint_auth.disconnect().await {
+        Ok(()) => Json(ApiMessage {
+            message: "processor disconnected; local credentials removed",
+        })
+        .into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
 
 async fn api_self_test(State(state): State<WebState>, headers: HeaderMap) -> Response {
     if let Err(r) = require_api_auth(&state, &headers).await {
@@ -1281,7 +1431,7 @@ async fn api_self_test(State(state): State<WebState>, headers: HeaderMap) -> Res
         return api_error(StatusCode::CONFLICT, "a self-test is already running");
     }
     let outcome = checks::run_self_test(
-        &MintHttpClient::new(config.mint_url.clone()),
+        &MintHttpClient::new(config.mint_url.clone()).with_auth(state.mint_auth.clone()),
         &state.branch,
         &config.method,
         &config.unit,

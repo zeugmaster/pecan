@@ -143,6 +143,39 @@ export interface UserEntry {
   created_at: number
 }
 
+export type AuthMode = "none" | "clear" | "blind"
+export interface AuthDraft {
+  auth_enabled: boolean
+  openid_discovery: string
+  openid_client_id: string
+  mint_max_bat: number
+  operations: Record<string, AuthMode>
+}
+export interface MintAuthStatus {
+  active: {
+    clear: { openid_discovery: string; client_id: string; protected_endpoints: { method: string; path: string }[] } | null
+    blind: { bat_max_mint: number; protected_endpoints: { method: string; path: string }[] } | null
+  } | null
+  operations: Record<string, AuthMode> | null
+  error: string | null
+  draft: AuthDraft | null
+  snippet: string | null
+  connection: { stored: boolean; connected: boolean; expires_at: number | null; blind_tokens: number; can_refresh: boolean }
+}
+export interface MintAuthLogin {
+  id: string
+  user_code: string
+  verification_uri: string
+  expires_at: number
+  interval: number
+}
+
+export const getMintAuth = () => requestJson<MintAuthStatus>("/api/mint/auth")
+export const saveMintAuth = (draft: AuthDraft) => post("/api/mint/auth", draft)
+export const startMintAuthLogin = () => post<MintAuthLogin>("/api/mint/auth/login")
+export const pollMintAuthLogin = (id: string) => post<{ status: "pending" | "connected"; interval?: number }>(`/api/mint/auth/login/${encodeURIComponent(id)}`)
+export const disconnectMintAuth = () => requestJson("/api/mint/auth", { method: "DELETE" })
+
 export interface AppSnapshot {
   now: number
   session: { username: string; must_change_password: boolean }

@@ -12,19 +12,13 @@ name = "cdk-branch-processor"
 path = "src/main.rs"
 
 # ---------------------------------------------------------------------------
-# cdk is consumed unmodified from crates.io. The pin is the first release
-# containing PR cashubtc/cdk#2295 ("propagate quote_id and pubkey on custom
-# mint quotes") — the one upstream change this processor depends on.
-#
-# The pins are exact (`=`) so the pre-release cannot silently float to a later
-# 0.18.x; the payment-processor protocol version check is strict-equality
-# ("4.0.0" at this release), so the attached cdk-mintd must run a release that
-# speaks the same protocol. Keep in lockstep with COMPATIBLE_CDK_VERSION in
-# src/config.rs — CI's pin-check enforces the pair.
+# CDK is consumed unmodified from crates.io. Keep these exact pins aligned
+# with COMPATIBLE_CDK_VERSION and the tested mintd image. Protocol 4.0.0
+# carries the quote_id and NUT-20 pubkey required by this processor.
 # ---------------------------------------------------------------------------
 [dependencies]
-cdk-common = { version = "=0.18.0-rc.0", default-features = false, features = ["mint", "grpc"] }
-cdk-payment-processor = { version = "=0.18.0-rc.0", default-features = false }
+cdk-common = { version = "=0.18.2", default-features = false, features = ["mint", "wallet", "grpc"] }
+cdk-payment-processor = { version = "=0.18.2", default-features = false }
 
 anyhow = "1"
 async-trait = "0.1"

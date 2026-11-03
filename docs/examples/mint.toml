@@ -8,17 +8,16 @@
 #
 # cdk-mintd 0.18+ stores its configuration in the mint database. This file is
 # an import document, not live config:
-#   fresh mint:    cdk-mintd config init --file mint.toml   (then start it)
+#   fresh mint:    cdk-mintd config init --new-mint --file mint.toml   (then start it)
 #   running mint:  cdk-mintd config export --file mint.toml
 #                  …merge your changes…
 #                  cdk-mintd config apply --file mint.toml
 #                  then restart cdk-mintd
 # Editing a mint.toml on disk without `config apply` changes nothing.
 #
-# Compatibility: cdk-mintd v0.18.0-rc.0 or later (docker image
-# cashubtc/mintd:0.18.0-rc.0) — the payment-processor protocol version is
-# checked strictly at connect time, and that release is the first that
-# speaks it. The console's Mint tab names the required release.
+# Tested with cdk-mintd v0.18.2 (cashubtc/mintd:0.18.2), using
+# payment-processor protocol 4.0.0. The Access tab generates the optional
+# [auth] section for clear and blind wallet authentication.
 
 [info]
 url = "http://localhost:8089"
