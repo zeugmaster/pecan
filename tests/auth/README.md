@@ -91,8 +91,46 @@ CASHU_DIR=/tmp/test-nutshell cashu --host http://127.0.0.1:18086 auth --mint --p
 Rust unit tests additionally cover route matching for custom methods, URL and
 policy validation, token binding, one-use persistence and credential removal.
 
-Production identity providers, TLS deployments, WebSocket authentication,
+Hosted identity-provider deployments, TLS deployments, WebSocket authentication,
 wallet restore and a full custom-method cash withdrawal are not covered by this
 suite. The UI exposes their CDK policy controls; verify your chosen wallets and
 provider before enabling them. The tests leave WebSocket authentication open
 so HTTP authentication compatibility can be assessed independently.
+
+## Keycloak customer management
+
+`keycloak.py` runs a real **Keycloak 26.8.1** container with a dedicated test
+realm, a public wallet client and a separate service client restricted to user
+management. It starts a fresh CDK 0.18.2 branch mint and Pecan on loopback ports
+18087, 19091 and 15052; Keycloak uses 18091. Existing stacks and wallets are
+untouched. Docker must be running and these ports must be free.
+
+Build Pecan and the UI as above. This test needs `httpx`, `PyJWT`, `cryptography`,
+`mnemonic` and Playwright (from the environment above), the official mintd
+binary in `AUTH_TEST_TOOLS` (default `/tmp/pecan-auth-tools`), and Chromium:
+
+```sh
+docker pull quay.io/keycloak/keycloak:26.8.1
+/tmp/pecan-auth-tools/venv/bin/playwright install chromium
+PYTHONDONTWRITEBYTECODE=1 /tmp/pecan-auth-tools/venv/bin/python tests/auth/keycloak.py
+```
+
+The test exercises anonymous and forced-password gates, unconfigured state,
+service-account protection, customer creation from the UI, temporary-password
+change, real device authorization, blind-auth deposit/withdrawal self-tests,
+disable/enable, password reset, session/offline-token revocation, search,
+pagination, provider errors and desktop/mobile rendering. It also verifies
+that disabling a customer **does not invalidate already issued blind tokens**.
+Screenshots and logs go into the printed private temporary directory; processes
+and the test container are removed on exit. Test passwords and mint seeds are
+disposable. Do not publish the private artifacts.
+
+No external email is sent. Production TLS, SMTP, federated user stores, MFA and
+other identity providers are outside this test. The earlier stock CLI wallet
+limitations still apply; this test uses Pecan's CDK-based mint-auth client.
+
+Add `--serve` to leave the isolated stack running after successful tests. It
+prints the console URL and disposable staff/customer credentials and reconnects
+the processor for manual testing. Ctrl-C (or SIGTERM to the printed PID) stops
+the preview and removes its container. This is a loopback development instance,
+not a production Keycloak deployment.

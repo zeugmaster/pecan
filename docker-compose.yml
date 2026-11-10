@@ -62,6 +62,10 @@ services:
       # the container with server.pem, server.key, and ca.pem. Requires a
       # matching bind mount below; see .env.example.
       CDK_BRANCH_PROCESSOR_TLS_DIR: "${GRPC_TLS_DIR:-}"
+      # Optional customer administration through a dedicated Keycloak realm.
+      CDK_BRANCH_PROCESSOR_KEYCLOAK_ISSUER: "${KEYCLOAK_ISSUER:-}"
+      CDK_BRANCH_PROCESSOR_KEYCLOAK_CLIENT_ID: "${KEYCLOAK_CLIENT_ID:-}"
+      CDK_BRANCH_PROCESSOR_KEYCLOAK_CLIENT_SECRET: "${KEYCLOAK_CLIENT_SECRET:-}"
     volumes:
       - processor-data:/var/lib/cdk-branch-processor
       - config-data:/var/lib/pecan/config

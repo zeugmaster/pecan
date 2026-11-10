@@ -370,6 +370,31 @@ export function runSelfTest() {
 
 // ---- users ----
 
+export interface WalletCustomer {
+  id: string
+  username: string
+  email: string | null
+  enabled: boolean
+  requiredActions: string[]
+}
+
+export type CustomerPage = { configured: false } | {
+  configured: true
+  issuer: string
+  customers: WalletCustomer[]
+  has_more: boolean
+  page_size: number
+}
+
+export interface CustomerPassword { password: string; password_confirm: string }
+export type CustomerAction = { action: "set_enabled"; enabled: boolean }
+  | ({ action: "reset_password" } & CustomerPassword)
+  | { action: "sign_out" }
+
+export const getCustomers = (search: string, offset: number) => requestJson<CustomerPage>(`/api/customers?${new URLSearchParams({ search, offset: String(offset) })}`)
+export const createCustomer = (form: { username: string; email: string } & CustomerPassword) => post("/api/customers", form)
+export const updateCustomer = (id: string, action: CustomerAction) => post(`/api/customers/${encodeURIComponent(id)}`, action)
+
 export function createUser(username: string, password: string, passwordConfirm: string) {
   return post<UserEntry>("/api/users", {
     username,

@@ -6,9 +6,9 @@
 //! user still exists.
 //!
 //! The mint is external and operator-run: this API only reads its public
-//! surfaces (checklist, identity, keysets, per-quote cross-checks) and writes
-//! nothing but the processor's own attachment config — which applies live,
-//! without a restart.
+//! surfaces (checklist, identity, keysets, per-quote cross-checks), keeping
+//! attachment configuration and auth drafts locally. Optional customer routes
+//! administer the separately configured Keycloak customer realm.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +31,7 @@ use crate::backend::BranchBackend;
 use crate::checks::{self, Check, MintIdentity, SelfTestOutcome};
 use crate::clients::{KeysetEntry, MintHttpClient};
 use crate::config::{render_mint_snippet, AppConfig, ConfigStore, PASSWORD_MIN_LENGTH};
+use crate::customers::{CustomerAction, CustomerError, Customers, NewCustomer};
 use crate::keysets::KeysetLog;
 use crate::sessions::SessionStore;
 use crate::state::{
@@ -62,6 +63,7 @@ pub struct WebState {
     /// When the mint's keysets were first seen and seen to stop issuing.
     pub keyset_log: KeysetLog,
     pub mint_auth: crate::mint_auth::MintAuth,
+    pub customers: Option<Customers>,
 }
 
 impl WebState {
@@ -81,6 +83,7 @@ impl WebState {
         self_test_running: Arc<AtomicBool>,
         keyset_log: KeysetLog,
         mint_auth: crate::mint_auth::MintAuth,
+        customers: Option<Customers>,
     ) -> Self {
         Self {
             branch,
@@ -97,6 +100,7 @@ impl WebState {
             self_test_running,
             keyset_log,
             mint_auth,
+            customers,
         }
     }
 }
@@ -128,6 +132,11 @@ pub fn router(state: WebState) -> Router {
         )
         .route("/api/mint/auth/login", post(api_mint_auth_login))
         .route("/api/mint/auth/login/{id}", post(api_mint_auth_poll))
+        .route(
+            "/api/customers",
+            get(api_customers).post(api_customers_create),
+        )
+        .route("/api/customers/{id}", post(api_customer_action))
         .route("/api/users", post(api_users_create))
         .route("/api/users/{username}", delete(api_users_delete))
         .route(
@@ -1459,6 +1468,104 @@ async fn api_self_test(State(state): State<WebState>, headers: HeaderMap) -> Res
     *state.self_test.write().await = Some(outcome.clone());
     state.branch.notify_ui_change();
     Json(outcome).into_response()
+}
+
+// ---------------- wallet customers ----------------
+
+#[derive(Default, Deserialize)]
+struct CustomerQuery {
+    #[serde(default)]
+    search: String,
+    #[serde(default)]
+    offset: u32,
+}
+
+fn customer_response(result: anyhow::Result<serde_json::Value>) -> Response {
+    let mut response = match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            let status = match error.downcast_ref::<CustomerError>() {
+                Some(CustomerError::Invalid(_)) => StatusCode::BAD_REQUEST,
+                Some(CustomerError::Duplicate) => StatusCode::CONFLICT,
+                Some(CustomerError::NotFound) => StatusCode::NOT_FOUND,
+                None => StatusCode::BAD_GATEWAY,
+            };
+            api_error(status, format!("{error:#}"))
+        }
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+}
+
+async fn customer_provider(state: &WebState) -> anyhow::Result<(&Customers, String)> {
+    let customers = state.customers.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("Configure the Keycloak customer service connection first.")
+    })?;
+    let config = state.config.read().await.clone();
+    let client = customers.wallet_client(&live_auth(&config).await?)?;
+    Ok((customers, client))
+}
+
+async fn api_customers(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<CustomerQuery>,
+) -> Response {
+    if let Err(r) = require_api_auth(&state, &headers).await {
+        return r;
+    }
+    customer_response(async {
+        if state.customers.is_none() {
+            return Ok(serde_json::json!({"configured": false}));
+        }
+        let (customers, _) = customer_provider(&state).await?;
+        let (users, has_more) = customers.list(query.search.trim(), query.offset).await?;
+        Ok(serde_json::json!({"configured": true, "issuer": customers.issuer(), "customers": users,
+            "has_more": has_more, "page_size": crate::customers::PAGE_SIZE}))
+    }.await)
+}
+
+async fn api_customers_create(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(form): Json<NewCustomer>,
+) -> Response {
+    let authed = match require_api_auth(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    customer_response(async {
+        let (customers, _) = customer_provider(&state).await?;
+        customers.create(form).await?;
+        tracing::info!(operator = %authed.username, "created Keycloak customer");
+        Ok(serde_json::json!({"message": "Customer created. They must change their temporary password at sign-in."}))
+    }.await)
+}
+
+async fn api_customer_action(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(action): Json<CustomerAction>,
+) -> Response {
+    let authed = match require_api_auth(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    customer_response(async {
+        let (customers, wallet_client) = customer_provider(&state).await?;
+        let name = match &action {
+            CustomerAction::SetEnabled { enabled: true } => "enabled",
+            CustomerAction::SetEnabled { enabled: false } => "disabled",
+            CustomerAction::ResetPassword { .. } => "password_reset",
+            CustomerAction::SignOut => "signed_out",
+        };
+        customers.act(&id, action, &wallet_client).await?;
+        tracing::info!(operator = %authed.username, customer_id = %id, action = name, "updated Keycloak customer");
+        Ok(serde_json::json!({"message": name}))
+    }.await)
 }
 
 // ---------------- users ----------------
