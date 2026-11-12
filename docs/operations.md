@@ -166,6 +166,71 @@ an old copy of the blind-token pool: proofs may already have been consumed.
 The existing Pecan access model is unchanged: all staff accounts can configure
 and disconnect this shared processor connection.
 
+### Wallet customer management (Keycloak)
+
+**Access → Wallet customers** lists and searches customers in a dedicated
+Keycloak realm. Operators can create an enabled account with a temporary
+password, reset its password, disable or enable access, and sign it out.
+Customers must change temporary passwords in Keycloak's browser sign-in flow.
+No invitation email is sent. Passwords pass directly to Keycloak; Pecan does
+not save them. Customer identities and credentials remain in Keycloak.
+
+1. Create a **dedicated customer realm** in Keycloak (not `master`). Keep
+   administrative users in `master`; all human accounts in the customer realm
+   are manageable through Pecan. Turn off self-registration if only enrolled
+   customers may use the mint. Keep realm backups alongside your other service
+   backups; Pecan's backup does not include Keycloak.
+2. Create the mint's **public wallet client** with authorization code + PKCE
+   (S256), device authorization, and the wallets' redirect URLs, including
+   `http://localhost:33388/callback`. Use signed JWT access tokens (RS256 or
+   ES256). Put this realm's discovery URL and the public client ID in the mint's
+   active auth configuration. Assign the `offline_access` optional client scope;
+   Pecan requests it for background refresh. Pecan's device flow also sends PKCE.
+3. Create a separate **confidential management client**, e.g. `pecan-management`,
+   with service accounts enabled, browser/direct-access flows disabled, and
+   `realm-management` service-account roles `query-users`, `view-users`, and
+   `manage-users`. Do not grant `realm-admin`. This credential can administer
+   users in the realm, so use a dedicated realm with no unrelated users.
+4. Add these values to the installation's private `.env` (mode `0600`):
+
+   ```dotenv
+   KEYCLOAK_ISSUER=https://id.example.org/realms/mint-customers
+   KEYCLOAK_CLIENT_ID=pecan-management
+   KEYCLOAK_CLIENT_SECRET=<management-client-secret>
+   ```
+
+   Recreate the processor with the installation's Compose file to load them:
+   `docker compose -f docker-compose.yml up -d --no-deps processor`.
+   For a native binary, prefix these three names with `CDK_BRANCH_PROCESSOR_`.
+   Set all three together; incomplete settings refuse startup. The service
+   credential is never returned to the browser or included in `setup.json`.
+5. Refresh **Wallet customers**. Pecan checks the mint's *active* discovery URL
+   against the configured realm before every customer request. A saved draft
+   is insufficient; a mismatch blocks customer management. HTTPS is required,
+   except loopback HTTP for local tests. Pecan refuses provider redirects.
+
+Every Pecan staff account can manage customers under the existing access model.
+Customer accounts do not grant Pecan console/teller access. Pecan hides and
+refuses to modify Keycloak service accounts. Changes are immediate; provider
+errors stay visible and lists are paginated. Create and password-reset operations
+must satisfy Keycloak's password/profile policies as well as Pecan's minimum
+eight-character password requirement. Additional required profile fields are
+completed by the customer in Keycloak. Email delivery, MFA enrollment, federation
+and realm/client administration remain in Keycloak.
+
+Disabling a customer blocks new sign-ins and refresh. Disable, reset-password
+and sign-out actions end Keycloak sessions and revoke the wallet client's
+offline refresh tokens. **Previously issued JWT access tokens remain valid
+until expiry, and already issued blind tokens cannot be revoked by customer.**
+Their use does not identify which account to disable. None of these actions
+changes ecash balances or grants Pecan a per-customer transaction history. Use
+short access-token lifetimes appropriate to the deployment. If a mutation's
+sign-out step fails, Pecan reports the completed change and asks the operator to
+retry **Sign out**, rather than claiming complete revocation.
+
+See the [Keycloak Admin REST API](https://www.keycloak.org/docs-api/latest/rest-api/index.html)
+and the reproducible local test in [`tests/auth/README.md`](../tests/auth/README.md#keycloak-customer-management).
+
 Reproducible wallet compatibility checks and their limits are documented in
 [`tests/auth/README.md`](../tests/auth/README.md).
 

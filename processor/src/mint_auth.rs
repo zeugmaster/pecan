@@ -7,6 +7,8 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
+use bitcoin_hashes::{sha256, Hash};
+use cdk_common::bitcoin::base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cdk_common::{
     amount::SplitTarget,
     dhke,
@@ -198,6 +200,7 @@ struct Pending {
     session: String,
     binding: Binding,
     device_code: String,
+    code_verifier: String,
     token_endpoint: String,
     view: Login,
     next_poll: u64,
@@ -313,9 +316,14 @@ impl MintAuth {
             .context("provider must support device authorization for processor sign-in")?;
         secure_url(&token_endpoint)?;
         secure_url(&device_endpoint)?;
+        // Keycloak enforces the public client's PKCE policy on device login too.
+        let code_verifier = cdk_common::secret::Secret::generate().to_string();
+        let code_challenge = pkce_challenge(&code_verifier);
         let device = successful(self.http.post(device_endpoint).form(&[
             ("client_id", binding.client_id.as_str()),
             ("scope", "openid offline_access"),
+            ("code_challenge_method", "S256"),
+            ("code_challenge", code_challenge.as_str()),
         ]))
         .await?;
         let verification_uri = string(&device, "verification_uri")?;
@@ -335,6 +343,7 @@ impl MintAuth {
             session,
             binding,
             device_code: string(&device, "device_code")?,
+            code_verifier,
             token_endpoint,
             next_poll: now() + view.interval,
             view: view.clone(),
@@ -371,6 +380,7 @@ impl MintAuth {
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ("device_code", &pending.device_code),
             ("client_id", &binding.client_id),
+            ("code_verifier", &pending.code_verifier),
         ]))
         .await?;
         if status.is_success() {
@@ -615,6 +625,10 @@ async fn successful(request: RequestBuilder) -> Result<Value> {
     Ok(body)
 }
 
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(sha256::Hash::hash(verifier.as_bytes()).to_byte_array())
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -625,6 +639,14 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_pkce_matches_rfc7636_vector() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
 
     #[test]
     fn policy_matches_custom_quotes_and_keeps_clear_off_blind_routes() {

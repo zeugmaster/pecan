@@ -53,6 +53,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { Field } from "@/components/shared/bits"
 import { WalletAccess } from "@/components/console/wallet-access"
+import { WalletCustomers } from "@/components/console/wallet-customers"
 
 export function AccessTab({ snapshot }: { snapshot: AppSnapshot }) {
   const me = snapshot.session.username
@@ -60,6 +61,7 @@ export function AccessTab({ snapshot }: { snapshot: AppSnapshot }) {
   return (
     <div className="grid gap-4">
       <WalletAccess key={snapshot.setup.mint_url} mintUrl={snapshot.setup.mint_url} />
+      <WalletCustomers key={`customers-${snapshot.setup.mint_url}`} />
       {snapshot.demo_password_active && (
         <Alert variant="emphasis">
           <TriangleAlert />

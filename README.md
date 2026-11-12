@@ -79,6 +79,9 @@ operations live in [`docs/operations.md`](docs/operations.md).
   **Access → Wallet access** prepares clear/blind auth policies and connects
   the processor to protected quote APIs. Apply the saved config to the mint
   and restart it to activate changes. See [wallet compatibility tests](tests/auth/README.md).
+  **Access → Wallet customers** manages customer accounts through a connected
+  Keycloak realm: add, reset passwords, enable/disable and sign out. See
+  [Keycloak setup](docs/operations.md#wallet-customer-management-keycloak).
   Wallet developers: [`docs/wallet-integration.md`](docs/wallet-integration.md).
 - Deposits are only accepted on wallet-locked quotes (NUT-20), and every
   settlement is cross-checked with the mint first.

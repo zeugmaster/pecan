@@ -20,6 +20,7 @@ mod backend;
 mod checks;
 mod clients;
 mod config;
+mod customers;
 mod keysets;
 mod mint_auth;
 mod sessions;
@@ -116,6 +117,7 @@ async fn main() -> Result<()> {
     let users_path = config_dir.join("users.json");
     let sessions_path = work_dir.join("sessions.json");
     let mint_auth = mint_auth::MintAuth::load(config_dir.join("mint-auth.json")).await?;
+    let customers = customers::Customers::from_env()?;
     // The managed-stack era mirrored setup.json into the work dir; register
     // it as a legacy migration source for installs upgrading mid-loss.
     let config_store =
@@ -302,6 +304,7 @@ async fn main() -> Result<()> {
         self_test_running,
         keyset_log,
         mint_auth,
+        customers,
     ));
 
     tracing::info!("branch-processor HTTP on {http_socket}");
