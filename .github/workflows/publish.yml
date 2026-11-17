@@ -86,7 +86,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: mintctl-linux-arm64
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
             asset: mintctl-darwin-arm64
     runs-on: ${{ matrix.runner }}
